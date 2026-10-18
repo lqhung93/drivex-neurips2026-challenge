@@ -96,11 +96,11 @@ def seed_everything(seed: int) -> None:
 
 
 def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints: list[int],
-               text_dropout: float = 0.0) -> dict:
+               text_dropout: float = 0.0, text_start: int = HISTORY_DIM) -> dict:
     """Train like scripts/run_h1.py (fixed budget, no early stopping); return {name: (C, N) preds}.
 
     `evals` maps a name to (features, base) evaluated at every epoch in `checkpoints` (0: before
-    training). `text_dropout` zeroes the text columns of that share of training rows, drawn from
+    training). `text_dropout` zeroes the text columns (from `text_start`) of that share of training rows, drawn from
     its own generator so the batch order stays the one of H1.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
@@ -116,7 +116,7 @@ def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints
             xb = x[indices]
             if text_dropout > 0:
                 xb = xb.clone()
-                xb[torch.rand(len(indices), generator=drop_gen) < text_dropout, HISTORY_DIM:] = 0
+                xb[torch.rand(len(indices), generator=drop_gen) < text_dropout, text_start:] = 0
             loss = torch.linalg.vector_norm(model(xb, base[indices]) - y[indices], dim=-1).mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
@@ -136,26 +136,47 @@ def pretrain(windows: dict, cfg: dict, seed: int, epochs: int) -> dict:
     return {k: v.clone() for k, v in model.state_dict().items()}
 
 
+def make_pair(text_dim: int, cfg: dict, seed: int, fusion: str, extra_dim: int, history_state: dict | None):
+    """Baseline and language model from the same start; with extra (non language) inputs the
+    baseline is H1 with those columns (concat, zero init), so both see the same non language input."""
+    seed_everything(seed)
+    h1 = InstructionMLP(extra_dim, cfg["hidden"]) if extra_dim else HistoryMLP(cfg["hidden"])
+    seed_everything(seed)
+    if extra_dim and fusion != "film":
+        raise ValueError("extra inputs are supported with --fusion film")
+    lm = FiLMMLP(text_dim, cfg["hidden"], extra_dim=extra_dim) if extra_dim else FUSIONS[fusion](text_dim, cfg["hidden"])
+    if history_state is not None:
+        (h1.load_history if extra_dim else h1.load_state_dict)(history_state)
+        lm.load_history(history_state)
+    return h1, lm
+
+
 def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndarray,
              cfg: dict, seed: int, checkpoints: list[int], shuffle_seed: int,
-             fusion: str = "concat", history_state: dict | None = None, text_dropout: float = 0.0) -> dict:
-    """H1 and the language model trained from the same start on `train`; predictions on `test`."""
+             fusion: str = "concat", history_state: dict | None = None, text_dropout: float = 0.0,
+             extra_train: np.ndarray | None = None, extra_test: np.ndarray | None = None,
+             alt_text_test: np.ndarray | None = None) -> dict:
+    """Baseline and language model trained from the same start on `train`; predictions on `test`."""
     x, base, y = prepare(train)
     tx, tbase, _ = prepare(test)
+    extra_dim = 0 if extra_train is None else extra_train.shape[1]
+    if extra_dim:  # non language inputs join the history features of both models
+        x, tx = with_text(x, extra_train), torch.cat((tx, torch.as_tensor(extra_test, dtype=torch.float32)), 1)
     perm = shuffle_across_scenes(test["scene_name"], seed=shuffle_seed)
-    seed_everything(seed)
-    h1 = HistoryMLP(cfg["hidden"])
-    seed_everything(seed)
-    lm = FUSIONS[fusion](text_train.shape[1], cfg["hidden"])
-    if history_state is not None:
-        h1.load_state_dict(history_state)
-        lm.load_history(history_state)
+    h1, lm = make_pair(text_train.shape[1], cfg, seed, fusion, extra_dim, history_state)
+    join = lambda a, b: torch.cat((a, torch.as_tensor(np.asarray(b, dtype=np.float32))), 1)
     preds = train_eval(h1, x, base, y, {"h1": (tx, tbase)}, cfg, seed, checkpoints)
-    preds |= train_eval(lm, with_text(x, text_train), base, y, {
-        "l1": (with_text(tx, text_test), tbase),
-        "l1_shuffled": (with_text(tx, text_test[perm]), tbase),
-    }, cfg, seed, checkpoints, text_dropout=text_dropout)
+    evals = {"l1": (join(tx, text_test), tbase), "l1_shuffled": (join(tx, text_test[perm]), tbase)}
+    if alt_text_test is not None:  # same rows, the instruction said differently (robustness, not training)
+        evals["l1_paraphrase"] = (join(tx, alt_text_test), tbase)
+    preds |= train_eval(lm, join(x, text_train), base, y, evals, cfg, seed, checkpoints,
+                        text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim)
     return preds
+
+
+def load_extra(args, name: str | None, split: str, cache: dict) -> np.ndarray | None:
+    """Non language inputs (e.g. map features) of `split`, row aligned like the text features."""
+    return None if not name else load_features(args.extra_feature_dir or args.feature_dir, name, split, cache["instruction"])
 
 
 def windows_without(windows: dict, scenes) -> dict:
@@ -247,6 +268,9 @@ def run_cv(args) -> None:
     assert_split_allowed("train", "train")
     train = load_cache(args.cache_dir / "train.npz")
     text = load_features(args.feature_dir, args.encoder, "train", train["instruction"])
+    extra = load_extra(args, args.extra_encoder, "train", train)
+    alt = load_features(args.feature_dir, args.paraphrase_encoder, "train", train["instruction"]) if args.paraphrase_encoder else None
+    variants = VARIANTS + (("l1_paraphrase",) if alt is not None else ())
     folds = scene_folds(train["scene_name"], k=args.folds)
     if len(np.unique(folds)) != args.folds:
         raise ValueError(f"some of the {args.folds} scene folds are empty")
@@ -258,7 +282,7 @@ def run_cv(args) -> None:
 
     start = time.monotonic()
     # oof[variant][seed] -> (C, N, 12, 2), filled fold by fold
-    oof = {v: np.zeros((len(args.seeds), len(checkpoints), *train["fut_xy"].shape), np.float32) for v in VARIANTS}
+    oof = {v: np.zeros((len(args.seeds), len(checkpoints), *train["fut_xy"].shape), np.float32) for v in variants}
     for si, seed in enumerate(args.seeds):
         for fold in range(args.folds):
             held = folds == fold
@@ -266,8 +290,11 @@ def run_cv(args) -> None:
                      if args.pretrain_epochs else None)
             preds = fit_pair(subset(train, ~held), text[~held], subset(train, held), text[held],
                              cfg, seed, checkpoints, shuffle_seed=seed * 100 + fold, fusion=args.fusion,
-                             history_state=state, text_dropout=args.text_dropout)
-            for v in VARIANTS:
+                             history_state=state, text_dropout=args.text_dropout,
+                             extra_train=None if extra is None else extra[~held],
+                             extra_test=None if extra is None else extra[held],
+                             alt_text_test=None if alt is None else alt[held])
+            for v in variants:
                 oof[v][si][:, held] = preds[v]
     elapsed = time.monotonic() - start
 
@@ -277,12 +304,13 @@ def run_cv(args) -> None:
         epochs[v], curve[v] = select_epoch(ade(oof[v], gt[None, None]), checkpoints, train["scene_name"])
     best = {v: checkpoints.index(e) for v, e in epochs.items()}
     # H1 uses its own CV epoch; L1 and its shuffle test share L1's epoch
-    picked = {"h1": oof["h1"][:, best["h1"]]} | {v: oof[v][:, best["l1"]] for v in VARIANTS[1:]}
+    picked = {"h1": oof["h1"][:, best["h1"]]} | {v: oof[v][:, best["l1"]] for v in variants[1:]}
     ades = {v: ade(p, gt[None]).mean(axis=0) for v, p in picked.items()}
 
     name = ("l1" if args.fusion == "concat" else "l2") + ("-p2" if args.pretrain_epochs else "")
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-{name}-{args.encoder}-cv"
-    config = {"stage": "cv", "model": MODEL_NAMES[args.fusion], "fusion": args.fusion,
+    config = {"stage": "cv", "model": MODEL_NAMES[args.fusion], "fusion": args.fusion, "extra_encoder": args.extra_encoder,
+              "paraphrase_encoder": args.paraphrase_encoder,
               "baseline": "h1-mlp-ca-residual", "encoder": args.encoder, "encoder_hf_id": ENCODERS[args.encoder],
               "split": "train", "folds": args.folds, "fold_rule": "scene_folds (md5 of scene name)",
               "seeds": args.seeds, "epochs_max": args.epochs, "eval_every": args.eval_every,
@@ -303,6 +331,10 @@ def run_cv(args) -> None:
         "metrics": report(ades, train, picked, args.seeds[0]),
         "vs_baseline": vs_baseline(args.baseline_run, args.output_dir, "oof", train, ades, args.seeds, args.seeds[0]),
     }
+    if alt is not None:  # ADE of L with the paraphrased instruction minus with the original (positive: worse)
+        record["paraphrase"] = {"encoder": args.paraphrase_encoder, "ade": float(ades["l1_paraphrase"].mean()),
+                                "cost": paired_delta(ades["l1_paraphrase"], ades["l1"], train["scene_name"], seed=args.seeds[0]),
+                                "delta_ade": paired_delta(ades["h1"], ades["l1_paraphrase"], train["scene_name"], seed=args.seeds[0])}
     write_run(args.output_dir / run_id, record, config, args.seeds)
     save_preds(args.output_dir / run_id, "oof", picked)
     print(json.dumps({k: record[k] for k in ("run_id", "selected_epoch", "epoch_at_cap")}, indent=2))
@@ -326,13 +358,14 @@ def load_cv(args) -> tuple:
 
 def run_val(args) -> None:
     cv, cfg, encoder, seeds, epochs, fusion, pretrain_epochs, text_dropout, windows = load_cv(args)
-
+    extra_name = cv["config"].get("extra_encoder")
     assert_split_allowed("train", "train")
     assert_split_allowed("val", "eval")
     train = load_cache(args.cache_dir / "train.npz")
     val = load_cache(args.cache_dir / "val.npz")
     text_train = load_features(args.feature_dir, encoder, "train", train["instruction"])
     text_val = load_features(args.feature_dir, encoder, "val", val["instruction"])
+    extra_train, extra_val = load_extra(args, extra_name, "train", train), load_extra(args, extra_name, "val", val)
 
     start = time.monotonic()
     preds = {v: [] for v in VARIANTS}
@@ -340,7 +373,8 @@ def run_val(args) -> None:
         checkpoints = sorted(set(epochs.values()))
         state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
         out = fit_pair(train, text_train, val, text_val, cfg, seed, checkpoints, shuffle_seed=seed,
-                       fusion=fusion, history_state=state, text_dropout=text_dropout)
+                       fusion=fusion, history_state=state, text_dropout=text_dropout,
+                       extra_train=extra_train, extra_test=extra_val)
         for v in VARIANTS:
             epoch = epochs["h1" if v == "h1" else "l1"]
             preds[v].append(out[v][checkpoints.index(epoch)])
@@ -351,6 +385,7 @@ def run_val(args) -> None:
     name = ("l1" if fusion == "concat" else "l2") + ("-p2" if pretrain_epochs else "")
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-{name}-{encoder}-val"
     config = {"stage": "val", "from_cv": args.from_cv, "model": cv["config"]["model"], "fusion": fusion,
+              "extra_encoder": extra_name,
               "baseline": cv["config"]["baseline"], "encoder": encoder,
               "encoder_hf_id": ENCODERS[encoder], "split": "val", "seeds": seeds, "epochs": epochs,
               "pretrain_epochs": pretrain_epochs, "text_dropout": text_dropout, **cfg}
@@ -382,8 +417,9 @@ def run_val(args) -> None:
 def run_test(args) -> None:
     """Submission files: retrain the CV picked pair on all of train, predict test (the only stage that reads test).
 
-    Writes <out-dir>/<language|history_only>/<TEAM>_CSV_version<N>.csv, one row per test scene from
-    its first instruction, trajectory averaged over the seeds, each checked by the validator,
+    Writes <out-dir>/<TEAM>_CSV_version<N>.csv (language model) and, for the same entry,
+    <TEAM>_CSV_version<N>_historyonly.csv (its matched baseline, empty instruction column), one row
+    per test scene from its first instruction, trajectory averaged over the seeds, each checked by the validator,
     and a run record with the sha256 of both files. Nothing is uploaded.
     """
     from drivex26.h1 import prepare_inputs
@@ -398,35 +434,37 @@ def run_test(args) -> None:
         raise ValueError("the test cache must not hold future poses")
     text_train = load_features(args.feature_dir, encoder, "train", train["instruction"])
     text_test = load_features(args.feature_dir, encoder, "test", test["instruction"])
+    extra_name = cv["config"].get("extra_encoder")
+    extra_train, extra_test = load_extra(args, extra_name, "train", train), load_extra(args, extra_name, "test", test)
     x, base, y = prepare(train)
     tx, tbase = prepare_inputs(test)
+    extra_dim = 0 if extra_train is None else extra_train.shape[1]
+    if extra_dim:
+        x, tx = with_text(x, extra_train), with_text(tx, extra_test)
+    join = lambda a, b: torch.cat((a, torch.as_tensor(np.asarray(b, dtype=np.float32))), 1)
 
     start = time.monotonic()
     preds = {"h1": [], "l1": []}
     for seed in seeds:
         state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
-        seed_everything(seed)
-        h1 = HistoryMLP(cfg["hidden"])
-        seed_everything(seed)
-        lm = FUSIONS[fusion](text_train.shape[1], cfg["hidden"])
-        if state is not None:
-            h1.load_state_dict(state)
-            lm.load_history(state)
+        h1, lm = make_pair(text_train.shape[1], cfg, seed, fusion, extra_dim, state)
         preds["h1"].append(train_eval(h1, x, base, y, {"t": (tx, tbase)}, cfg, seed, [epochs["h1"]])["t"][0])
-        preds["l1"].append(train_eval(lm, with_text(x, text_train), base, y, {"t": (with_text(tx, text_test), tbase)},
-                                      cfg, seed, [epochs["l1"]], text_dropout=text_dropout)["t"][0])
+        preds["l1"].append(train_eval(lm, join(x, text_train), base, y, {"t": (join(tx, text_test), tbase)},
+                                      cfg, seed, [epochs["l1"]], text_dropout=text_dropout,
+                                      text_start=HISTORY_DIM + extra_dim)["t"][0])
     elapsed = time.monotonic() - start
 
-    name = form_csv_name(args.team, args.version)
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-submission-v{args.version}"
     out_dir = Path(args.out_dir or ROOT / "data" / "submissions" / run_id)
     expected = set(np.unique(test["scene_token"]))
     files = {}
+    out_dir.mkdir(parents=True, exist_ok=True)
     for variant, folder in (("l1", "language"), ("h1", "history_only")):
         tokens, instructions, traj = first_per_scene(test["scene_token"], test["instruction"],
                                                      np.mean(preds[variant], axis=0))
-        path = out_dir / folder / name
-        path.parent.mkdir(parents=True, exist_ok=True)
+        if variant == "h1":  # the baseline does not read the instruction, so the column stays empty
+            instructions = np.full(len(tokens), "")
+        path = out_dir / form_csv_name(args.team, args.version, history_only=variant == "h1")
         write_submission(path, tokens, instructions, traj)
         errors, warnings = validate_submission(path, expected_tokens=expected, team=args.team)
         if errors:
@@ -435,6 +473,7 @@ def run_test(args) -> None:
                          "sha256": sha256(path), "rows": len(tokens), "warnings": warnings}
         print(f"{folder}: {len(tokens)} rows -> {path}" + (f" (warnings: {warnings})" if warnings else ""))
     config = {"stage": "test", "purpose": "submission", "from_cv": args.from_cv, "model": cv["config"]["model"],
+              "extra_encoder": extra_name,
               "fusion": fusion, "encoder": encoder, "seeds": seeds, "epochs": epochs, "pretrain_epochs": pretrain_epochs,
               "text_dropout": text_dropout, "policy": "first instruction per scene, mean trajectory over seeds",
               "team": args.team, "version": args.version, **cfg}
@@ -451,6 +490,7 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=ROOT / "results" / "runs")
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--windows", type=Path, default=ROOT / "data" / "cache" / "windows_train.npz")
+    parser.add_argument("--extra-feature-dir", type=Path, default=None, help="feature dir of --extra-encoder (default: --feature-dir)")
     parser.add_argument("--baseline-run", default=None, help="run of the same stage whose H1 this one is compared to")
     sub = parser.add_subparsers(dest="stage", required=True)
     cv = sub.add_parser("cv", help="5-fold CV by scene on train")
@@ -466,6 +506,10 @@ def main() -> None:
     cv.add_argument("--fusion", choices=list(FUSIONS), default="concat")
     cv.add_argument("--pretrain-epochs", type=int, default=0, help="P2 pretraining on sliding windows; 0: none")
     cv.add_argument("--text-dropout", type=float, default=0.0)
+    cv.add_argument("--paraphrase-encoder", default=None,
+                    help="text features of the same instructions said differently; adds a robustness evaluation")
+    cv.add_argument("--extra-encoder", choices=list(ENCODERS), default=None,
+                    help="non language input given to both models (e.g. map); needs --fusion film")
     val = sub.add_parser("val", help="one-time val evaluation at the epochs a CV run picked")
     val.add_argument("--from-cv", required=True)
     test = sub.add_parser("test", help="submission files from the pair a CV run picked (test read for submission only)")

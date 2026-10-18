@@ -73,8 +73,8 @@ python scripts/run_l1.py val --from-cv l2-p2-cv                                 
 # submission file, named as the upload form requires, validated on write
 python scripts/build_cache.py --nusc-root data/nuscenes --split test --purpose submission
 python scripts/language/encode_text.py --encoders minilm --splits test --purpose submission
-python scripts/run_l1.py test --from-cv l2-p2-cv --team DHN --version 0   # language/ and history_only/ CSVs
-python scripts/validate_submission.py data/submissions/<run_id>/language/DHN_CSV_version0.csv --team DHN --test-cache data/cache/test.npz
+python scripts/run_l1.py test --from-cv l2-p2-cv --team DHN --version 0   # DHN_CSV_version0.csv + DHN_CSV_version0_historyonly.csv
+python scripts/validate_submission.py data/submissions/<run_id>/DHN_CSV_version0.csv --team DHN --test-cache data/cache/test.npz
 # kinematic baselines only: python scripts/make_submission.py --model ca --team DHN --version 0
 ```
 

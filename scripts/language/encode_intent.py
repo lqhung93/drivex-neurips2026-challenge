@@ -43,6 +43,7 @@ def main() -> None:
     p.add_argument("--feature-dir", type=Path, default=ROOT / "data" / "features" / "text")
     p.add_argument("--splits", nargs="+", default=["train", "val"])
     p.add_argument("--purpose", default="eval")
+    p.add_argument("--name", default="intent", help="feature name, e.g. intentpara for the intents of paraphrases")
     args = p.parse_args()
     for split in args.splits:
         assert_split_allowed(split, args.purpose)
@@ -53,7 +54,7 @@ def main() -> None:
         emb = np.stack([one_hot(r) for r in intents["rows"]])
         info = {"hf_id": f"{intents['model']} intents, one-hot (scripts/language/encode_intent.py)", "dim": DIM,
                 "parsed": float(np.mean([r is not None for r in intents["rows"]]))}
-        print(save_features(args.feature_dir, "intent", split, emb, texts, info), emb.shape, round(info["parsed"], 3))
+        print(save_features(args.feature_dir, args.name, split, emb, texts, info), emb.shape, round(info["parsed"], 3))
 
 
 if __name__ == "__main__":

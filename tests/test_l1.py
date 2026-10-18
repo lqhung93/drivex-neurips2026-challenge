@@ -175,10 +175,12 @@ def test_test_stage_writes_two_valid_submission_files(tmp_path) -> None:
     args = types.SimpleNamespace(output_dir=runs, from_cv="cv", cache_dir=caches, feature_dir=feats,
                                  windows=tmp_path / "none.npz", team="DHN", version=0, run_id="sub", out_dir=tmp_path / "out")
     runner.run_test(args)
-    for folder in ("language", "history_only"):
-        path = tmp_path / "out" / folder / "DHN_CSV_version0.csv"
+    for name in ("DHN_CSV_version0.csv", "DHN_CSV_version0_historyonly.csv"):
+        path = tmp_path / "out" / name
         assert validate_submission(path, expected_tokens={"tok0", "tok1", "tok2"}, team="DHN")[0] == []
         assert len(path.read_text().splitlines()) == 4  # header + one row per test scene
+    baseline = (tmp_path / "out" / "DHN_CSV_version0_historyonly.csv").read_text().splitlines()[1]
+    assert baseline.split(",")[1] == ""  # empty instruction column in the history only file
     record = json.loads((runs / "sub" / "metrics.json").read_text())
     assert record["config"]["purpose"] == "submission" and record["uploaded"] is False
 
@@ -200,3 +202,37 @@ def test_intent_one_hot_layout() -> None:
     assert v.shape == (26,) and v.sum() == 4
     assert v[1] == 1 and v[10 + 10] == 1 and v[21 + 1] == 1 and v[25] == 1  # turn_left, then none, slow, wait
     assert not enc.one_hot(None).any()  # unparsed intent = blank instruction
+
+
+def test_film_with_extra_inputs_starts_as_its_matched_baseline() -> None:
+    runner = _run_l1()
+    features, base = prepare_inputs(history_cache())
+    rng = np.random.default_rng(2)
+    extra, text = rng.normal(size=(len(features), 5)), rng.normal(size=(len(features), 4))
+    torch.manual_seed(7)
+    pretrained = HistoryMLP(hidden=16)
+    with torch.no_grad():
+        pretrained.net[4].weight.normal_()
+    h2, lm = runner.make_pair(4, {"hidden": 16}, 0, "film", 5, pretrained.state_dict())
+    x = with_text(features, extra)
+    xt = torch.cat((x, torch.as_tensor(text, dtype=torch.float32)), 1)
+    np.testing.assert_allclose(predict(lm, xt, base), predict(h2, x, base), atol=1e-6)
+    np.testing.assert_allclose(predict(h2, x, base), predict(pretrained, features, base), atol=1e-6)
+
+
+def test_text_dropout_keeps_extra_columns() -> None:
+    runner = _run_l1()
+    features, base = prepare_inputs(history_cache(8))
+    x = torch.cat((features, torch.full((8, 3), 2.0), torch.ones(8, 4)), 1)
+    seen = []
+
+    class Spy(HistoryMLP):
+        def forward(self, xb, b):
+            seen.append((xb[:, 12:15].clone(), xb[:, 15:].sum(dim=1).tolist()))
+            return super().forward(xb[:, :12], b)
+
+    runner.train_eval(Spy(8), x, base, base + 1.0, {}, {"lr": 0.01, "weight_decay": 0.0, "batch_size": 4}, 0, [3],
+                      text_dropout=0.5, text_start=15)
+    assert all((extra == 2.0).all() for extra, _ in seen)  # map columns never dropped
+    flat = [v for _, t in seen for v in t]
+    assert 0.0 in flat and 4.0 in flat

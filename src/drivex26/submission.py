@@ -2,8 +2,9 @@
 
 The spec gives two headers (with / without `instruction`); we write the one with it and
 accept both. One row per sample_token (= nuScenes scene_token), 12 (x, y) in metres,
-anchor frame. File name follows the upload form, <TEAM>_CSV_version<N>.csv (§6b): a wrongly
-named upload is not a valid entry, so nothing else is accepted.
+anchor frame. File name follows the upload form, <TEAM>_CSV_version<N>.csv: a wrongly named
+upload is not a valid entry, so nothing else is accepted, except the matched history only
+baseline of the same entry, <TEAM>_CSV_version<N>_historyonly.csv.
 """
 
 import csv
@@ -16,12 +17,13 @@ import numpy as np
 COORD_COLUMNS = [f"{axis}{i}" for i in range(1, 13) for axis in "xy"]
 HEADERS = (["sample_token", "instruction", *COORD_COLUMNS], ["sample_token", *COORD_COLUMNS])
 MAX_STEP_M = 25.0  # 0.5 s step; 50 m/s is far above any nuScenes ego speed
-FILE_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9_-]*)_CSV_version(\d+)\.csv")
+FILE_NAME = re.compile(r"([A-Za-z0-9][A-Za-z0-9_-]*)_CSV_version(\d+)(_historyonly)?\.csv")
 
 
-def form_csv_name(team: str, version: int) -> str:
-    """Upload form file name, e.g. form_csv_name("drivex26", 0) == "drivex26_CSV_version0.csv"."""
-    name = f"{team}_CSV_version{version}.csv"
+def form_csv_name(team: str, version: int, history_only: bool = False) -> str:
+    """Upload form file name, e.g. form_csv_name("drivex26", 0) == "drivex26_CSV_version0.csv";
+    with history_only, the matched baseline of the same entry: "drivex26_CSV_version0_historyonly.csv"."""
+    name = f"{team}_CSV_version{version}{'_historyonly' if history_only else ''}.csv"
     if version < 0 or not FILE_NAME.fullmatch(name):
         raise ValueError(f"invalid team or version for the form file name: {team!r}, {version!r}")
     return name
@@ -68,7 +70,7 @@ def validate_submission(path, expected_tokens=None, team: str | None = None) -> 
     warnings: list[str] = []
     name = FILE_NAME.fullmatch(path.name)
     if not name:
-        errors.append(f"file name must be <TEAM>_CSV_version<N>.csv (upload form rule), got {path.name}")
+        errors.append(f"file name must be <TEAM>_CSV_version<N>.csv (upload form rule) or its _historyonly baseline, got {path.name}")
     elif team is not None and name.group(1) != team:
         errors.append(f"file name team {name.group(1)!r} does not match {team!r}")
 

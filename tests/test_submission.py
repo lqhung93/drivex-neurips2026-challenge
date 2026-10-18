@@ -101,7 +101,8 @@ def test_mean_per_scene_averages_predictions_of_same_scene():
     np.testing.assert_allclose(out[1], 5.0)
 
 
-@pytest.mark.parametrize("name", ["drivex26_CSV_version0.csv", "Team-A_CSV_version12.csv"])
+@pytest.mark.parametrize("name", ["drivex26_CSV_version0.csv", "Team-A_CSV_version12.csv",
+                                  "drivex26_CSV_version0_historyonly.csv"])
 def test_form_filenames_are_accepted(tmp_path, name):
     path = tmp_path / name
     write_submission(path, ["tokA"], ["go"], straight(1))
@@ -109,7 +110,8 @@ def test_form_filenames_are_accepted(tmp_path, name):
 
 
 @pytest.mark.parametrize("name", ["submission.csv", "drivex26_CSV_versionX.csv", "drivex26_CSV_v1.csv",
-                                  "_CSV_version0.csv", "drivex26_CSV_version0.txt"])
+                                  "_CSV_version0.csv", "drivex26_CSV_version0.txt",
+                                  "drivex26_CSV_version0_baseline.csv", "drivex26_CSV_version0_historyonly.txt"])
 def test_other_filenames_are_rejected(tmp_path, name):
     # A wrongly named upload is not a valid entry, so the page's submission.csv is rejected too.
     path = tmp_path / name
@@ -128,6 +130,7 @@ def test_team_name_must_match_when_given(tmp_path):
 def test_form_filename_builder():
     from drivex26.submission import form_csv_name
     assert form_csv_name("drivex26", 3) == "drivex26_CSV_version3.csv"
+    assert form_csv_name("drivex26", 3, history_only=True) == "drivex26_CSV_version3_historyonly.csv"
     with pytest.raises(ValueError):
         form_csv_name("drivex26", -1)
     with pytest.raises(ValueError):

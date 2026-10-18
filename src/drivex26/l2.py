@@ -18,22 +18,36 @@ from drivex26.l1 import HISTORY_DIM
 class FiLMMLP(nn.Module):
     """Residual on CA from history features, FiLM conditioned on a text embedding."""
 
-    def __init__(self, text_dim: int, hidden: int = 128, text_hidden: int = 32) -> None:
+    def __init__(self, text_dim: int, hidden: int = 128, text_hidden: int = 32, extra_dim: int = 0) -> None:
         super().__init__()
-        if text_dim < 1:
-            raise ValueError("text_dim must be positive")
-        self.text_dim = text_dim
+        if text_dim < 1 or extra_dim < 0:
+            raise ValueError("text_dim must be positive and extra_dim nonnegative")
+        self.text_dim, self.extra_dim = text_dim, extra_dim
         self.history = HistoryMLP(hidden)  # drawn first: same weights as H1 under the same seed
+        if extra_dim:  # non language inputs (e.g. the map) as extra first layer columns starting at zero
+            first, widened = self.history.net[0], nn.Linear(HISTORY_DIM + extra_dim, hidden)
+            with torch.no_grad():
+                widened.weight.zero_()
+                widened.weight[:, :HISTORY_DIM] = first.weight
+                widened.bias.copy_(first.bias)
+            self.history.net[0] = widened
         self.film = nn.Sequential(nn.Linear(text_dim, text_hidden), nn.ReLU(), nn.Linear(text_hidden, 2 * hidden))
         nn.init.zeros_(self.film[-1].weight)
         nn.init.zeros_(self.film[-1].bias)
 
     def load_history(self, state: dict) -> None:
-        """Copy a (pretrained) HistoryMLP state into the history network."""
-        self.history.load_state_dict(state)
+        """Copy a (pretrained) HistoryMLP state into the history network; extra columns stay as they are."""
+        with torch.no_grad():
+            net = self.history.net
+            net[0].weight[:, :HISTORY_DIM] = state["net.0.weight"]
+            net[0].bias.copy_(state["net.0.bias"])
+            for i in (2, 4):
+                net[i].weight.copy_(state[f"net.{i}.weight"])
+                net[i].bias.copy_(state[f"net.{i}.bias"])
 
     def forward(self, features: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
-        history, text = features[:, :HISTORY_DIM], features[:, HISTORY_DIM:]
+        split = HISTORY_DIM + self.extra_dim
+        history, text = features[:, :split], features[:, split:]
         net = self.history.net
         h = net[3](net[2](net[1](net[0](history))))
         gamma, beta = self.film(text).chunk(2, dim=-1)
