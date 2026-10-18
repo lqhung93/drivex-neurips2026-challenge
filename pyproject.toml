@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drivex26"
+version = "0.0.1"
+description = "doScenes instructed ego-trajectory prediction (DriveX @ NeurIPS 2026)"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch",
+    "pyquaternion",
+    "nuscenes-devkit>=1.2",  # older releases pull matplotlib 3.5.3, which failed to build on Python 3.11
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+lang = ["sentence-transformers>=3", "transformers>=4.40", "scikit-learn"]  # frozen text encoders
+eda = ["plotly>=6", "nbconvert", "ipykernel"]  # instruction EDA
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

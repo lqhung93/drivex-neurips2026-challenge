@@ -1,0 +1,13 @@
+{
+  "protocol": "P1",
+  "folds": 5,
+  "seeds": [0, 1, 2],
+  "max_epochs": 3000,
+  "eval_every": 10,
+  "selection_metric": "ade_scene",
+  "candidates": [
+    {"name": "h128-lr1e-3", "hidden": 128, "lr": 0.001, "weight_decay": 0.0001, "batch_size": 128},
+    {"name": "h64-lr1e-3", "hidden": 64, "lr": 0.001, "weight_decay": 0.0001, "batch_size": 128},
+    {"name": "h128-lr3e-4", "hidden": 128, "lr": 0.0003, "weight_decay": 0.0001, "batch_size": 128}
+  ]
+}

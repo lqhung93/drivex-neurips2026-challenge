@@ -1,0 +1,13 @@
+# data, third party code and outputs are fetched or generated locally, never committed
+data/
+third_party/
+results/
+*.npy
+*.npz
+*.pt
+*.ckpt
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.env
