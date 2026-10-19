@@ -184,6 +184,23 @@ def test_test_stage_writes_two_valid_submission_files(tmp_path) -> None:
     record = json.loads((runs / "sub" / "metrics.json").read_text())
     assert record["config"]["purpose"] == "submission" and record["uploaded"] is False
 
+    # a CV run trained with paraphrase augmentation: the test stage retrains the same way
+    save_features(feats, "minilmpara", "train", rng.normal(size=(12, 4)).astype(np.float32),
+                  [str(t) for t in train["instruction"]], {})
+    cv = json.loads((runs / "cv" / "metrics.json").read_text())
+    cv["config"] |= {"augment_encoder": "minilmpara", "augment_prob": 0.5}
+    (runs / "cv" / "metrics.json").write_text(json.dumps(cv))
+    args.run_id, args.version, args.out_dir = "sub-aug", 1, tmp_path / "out1"
+    runner.run_test(args)
+    assert validate_submission(tmp_path / "out1" / "DHN_CSV_version1.csv", expected_tokens={"tok0", "tok1", "tok2"},
+                               team="DHN")[0] == []
+    assert (tmp_path / "out1" / "DHN_CSV_version1_historyonly.csv").read_text() == \
+        (tmp_path / "out" / "DHN_CSV_version0_historyonly.csv").read_text()  # baseline untouched
+    assert (tmp_path / "out1" / "DHN_CSV_version1.csv").read_text() != \
+        (tmp_path / "out" / "DHN_CSV_version0.csv").read_text()  # language model trained with the swaps
+    aug = json.loads((runs / "sub-aug" / "metrics.json").read_text())["config"]
+    assert aug["augment_encoder"] == "minilmpara" and aug["augment_prob"] == 0.5
+
     test["fut_xy"] = np.zeros((7, 12, 2), np.float32)  # a test cache with futures is refused
     save_cache(test, caches / "test.npz")
     args.run_id = "sub2"
@@ -253,3 +270,36 @@ def test_text_dropout_keeps_extra_columns() -> None:
     assert all((extra == 2.0).all() for extra, _ in seen)  # map columns never dropped
     flat = [v for _, t in seen for v in t]
     assert 0.0 in flat and 4.0 in flat
+
+
+def test_blank_test_matches_the_language_model_on_blank_rows() -> None:
+    runner = _run_l1()
+    cache = history_cache(8)
+    cache["fut_xy"] = np.random.default_rng(4).normal(size=(8, 12, 2)).astype(np.float32)
+    cache["scene_name"] = np.array([f"s{i % 4}" for i in range(8)])
+    text = np.random.default_rng(5).normal(size=(8, 3)).astype(np.float32)
+    cfg = {"hidden": 8, "lr": 1e-2, "weight_decay": 0.0, "batch_size": 4}
+    text[4:] = 0  # rows 4..7 are already blank
+    preds = runner.fit_pair(cache, text, cache, text, cfg, 0, [3], shuffle_seed=0, fusion="film", blank_test=True)
+    assert preds["l1_blank"].shape == preds["l1"].shape
+    np.testing.assert_allclose(preds["l1_blank"][:, 4:], preds["l1"][:, 4:], atol=1e-6)
+    assert not np.allclose(preds["l1_blank"][:, :4], preds["l1"][:, :4])
+
+
+def test_augmentation_swaps_text_columns_without_changing_the_batch_order() -> None:
+    runner = _run_l1()
+    cache = history_cache(8)
+    cache["fut_xy"] = np.random.default_rng(6).normal(size=(8, 12, 2)).astype(np.float32)
+    x, base, y = runner.prepare(cache)
+    text, alt = (torch.as_tensor(np.random.default_rng(s).normal(size=(8, 3)), dtype=torch.float32) for s in (7, 8))
+    cfg = {"hidden": 8, "lr": 1e-2, "weight_decay": 0.0, "batch_size": 4}
+    ev = lambda t: {"e": (torch.cat((x, t), 1), base)}
+
+    def fit(t, **kw):
+        torch.manual_seed(0)
+        model = runner.FiLMMLP(3, 8)
+        return runner.train_eval(model, torch.cat((x, t), 1), base, y, ev(text), cfg, 0, [4], **kw)["e"]
+
+    np.testing.assert_array_equal(fit(text, text_alt=alt, alt_prob=1.0), fit(alt))  # every row swapped
+    np.testing.assert_array_equal(fit(text, text_alt=alt, alt_prob=0.0), fit(text))  # off: unchanged
+    assert not np.allclose(fit(text, text_alt=alt, alt_prob=0.5), fit(text))

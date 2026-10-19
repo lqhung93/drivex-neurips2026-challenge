@@ -2,11 +2,15 @@
 
   python scripts/language/extract_intent.py --splits train val --out-dir results/runs/intent-3b
   python scripts/language/extract_intent.py --splits test --purpose submission --out-dir results/runs/intent-3b
+  python scripts/language/extract_intent.py --splits train --paraphrase --out-dir results/runs/intentpara-3b
 
 Unique instructions are run once (greedy, so identical text gives identical output); outputs that
 fail to parse get one retry with a longer budget, then stay null. Writes <out-dir>/intent_<split>.json:
 one entry per cache row, in cache order, plus the sha256 of the instruction column, which
 scripts/language/encode_intent.py turns into the L3 input. The test split needs --purpose submission.
+With --paraphrase the same model first rewrites each instruction with other words and the same meaning,
+then extracts the intent of the rewrite (training augmentation and the paraphrase robustness test);
+rows and texts_sha256 still follow the original instructions, so the features align with the cache.
 """
 
 import argparse
@@ -32,6 +36,8 @@ SYSTEM = (
     f'"speed" (one of {SPEEDS}), "wait_first" (true if the car must wait before acting), '
     '"reference" (short noun phrase of the object it refers to, or null). Reply with JSON only.'
 )
+PARAPHRASE = ("Rewrite the driving instruction for the ego car with different words and the same meaning. "
+              "Keep every maneuver, its order and any object it refers to. Reply with the rewritten instruction only.")
 
 
 def parse(text: str):
@@ -53,6 +59,7 @@ def main() -> None:
     p.add_argument("--out-dir", type=Path, required=True)
     p.add_argument("--splits", nargs="+", default=["train", "val"])
     p.add_argument("--purpose", default="eval")
+    p.add_argument("--paraphrase", action="store_true", help="intent of a rewrite of each instruction (same meaning)")
     args = p.parse_args()
     for split in args.splits:
         assert_split_allowed(split, args.purpose)
@@ -63,8 +70,8 @@ def main() -> None:
     tok = AutoTokenizer.from_pretrained(MODEL, padding_side="left")
     model = AutoModelForCausalLM.from_pretrained(MODEL, torch_dtype=torch.float16, device_map="cuda:0").eval()
 
-    def generate(texts, max_new_tokens):
-        prompts = [tok.apply_chat_template([{"role": "system", "content": SYSTEM}, {"role": "user", "content": t}],
+    def generate(texts, max_new_tokens, system=SYSTEM):
+        prompts = [tok.apply_chat_template([{"role": "system", "content": system}, {"role": "user", "content": t}],
                                            tokenize=False, add_generation_prompt=True) for t in texts]
         out = []
         for i in range(0, len(prompts), BATCH):
@@ -79,14 +86,18 @@ def main() -> None:
         texts = [str(t) for t in load_cache(args.cache_dir / f"{split}.npz")["instruction"]]
         unique = sorted(set(texts))
         start = time.perf_counter()
-        raw = dict(zip(unique, generate(unique, 80)))
+        source = (dict(zip(unique, [o.strip().strip('"') for o in generate(unique, 80, PARAPHRASE)]))
+                  if args.paraphrase else {t: t for t in unique})
+        raw = dict(zip(unique, generate([source[t] for t in unique], 80)))
         parsed = {t: parse(r) for t, r in raw.items()}
         failed = [t for t, v in parsed.items() if v is None]
-        for t, r in zip(failed, generate(failed, 160)):
+        for t, r in zip(failed, generate([source[t] for t in failed], 160)):
             raw[t], parsed[t] = r, parse(r)
-        (args.out_dir / f"intent_{split}.json").write_text(json.dumps(
-            {"model": MODEL, "split": split, "texts_sha256": texts_sha256(texts), "rows": [parsed[t] for t in texts],
-             "raw": [raw[t] for t in texts]}, indent=1))
+        record = {"model": MODEL, "split": split, "texts_sha256": texts_sha256(texts), "rows": [parsed[t] for t in texts],
+                  "raw": [raw[t] for t in texts]}
+        if args.paraphrase:
+            record["paraphrases"] = [source[t] for t in texts]
+        (args.out_dir / f"intent_{split}.json").write_text(json.dumps(record, indent=1))
         print(json.dumps({split: {"rows": len(texts), "unique": len(unique), "retried": len(failed),
                                   "seconds": round(time.perf_counter() - start, 1),
                                   "valid_unique": float(np.mean([v is not None for v in parsed.values()]))}}),

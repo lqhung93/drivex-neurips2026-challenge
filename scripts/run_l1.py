@@ -96,16 +96,20 @@ def seed_everything(seed: int) -> None:
 
 
 def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints: list[int],
-               text_dropout: float = 0.0, text_start: int = HISTORY_DIM) -> dict:
+               text_dropout: float = 0.0, text_start: int = HISTORY_DIM,
+               text_alt: torch.Tensor | None = None, alt_prob: float = 0.0) -> dict:
     """Train like scripts/run_h1.py (fixed budget, no early stopping); return {name: (C, N) preds}.
 
     `evals` maps a name to (features, base) evaluated at every epoch in `checkpoints` (0: before
     training). `text_dropout` zeroes the text columns (from `text_start`) of that share of training rows, drawn from
-    its own generator so the batch order stays the one of H1.
+    its own generator so the batch order stays the one of H1. `text_alt` holds other text columns for the
+    same rows (e.g. the intent of a paraphrase); that share `alt_prob` of training rows uses them instead,
+    drawn from a third generator, before the dropout.
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     generator = torch.Generator().manual_seed(seed)
     drop_gen = torch.Generator().manual_seed(seed + 10_000)
+    alt_gen = torch.Generator().manual_seed(seed + 20_000)
     out = {name: [] for name in evals}
     if 0 in checkpoints:
         for name, (ex, eb) in evals.items():
@@ -114,6 +118,10 @@ def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints
         model.train()
         for indices in torch.randperm(len(x), generator=generator).split(cfg["batch_size"]):
             xb = x[indices]
+            if text_alt is not None and alt_prob > 0:
+                xb = xb.clone()
+                swap = torch.rand(len(indices), generator=alt_gen) < alt_prob
+                xb[swap, text_start:] = text_alt[indices][swap]
             if text_dropout > 0:
                 xb = xb.clone()
                 xb[torch.rand(len(indices), generator=drop_gen) < text_dropout, text_start:] = 0
@@ -155,7 +163,8 @@ def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndar
              cfg: dict, seed: int, checkpoints: list[int], shuffle_seed: int,
              fusion: str = "concat", history_state: dict | None = None, text_dropout: float = 0.0,
              extra_train: np.ndarray | None = None, extra_test: np.ndarray | None = None,
-             alt_text_test: np.ndarray | None = None) -> dict:
+             alt_text_test: np.ndarray | None = None, blank_test: bool = False,
+             alt_text_train: np.ndarray | None = None, alt_prob: float = 0.0) -> dict:
     """Baseline and language model trained from the same start on `train`; predictions on `test`."""
     x, base, y = prepare(train)
     tx, tbase, _ = prepare(test)
@@ -169,8 +178,12 @@ def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndar
     evals = {"l1": (join(tx, text_test), tbase), "l1_shuffled": (join(tx, text_test[perm]), tbase)}
     if alt_text_test is not None:  # same rows, the instruction said differently (robustness, not training)
         evals["l1_paraphrase"] = (join(tx, alt_text_test), tbase)
+    if blank_test:  # same rows, no instruction: text columns zero, as in blank instruction dropout
+        evals["l1_blank"] = (join(tx, np.zeros_like(text_test)), tbase)
     preds |= train_eval(lm, join(x, text_train), base, y, evals, cfg, seed, checkpoints,
-                        text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim)
+                        text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim,
+                        text_alt=None if alt_text_train is None else torch.as_tensor(alt_text_train, dtype=torch.float32),
+                        alt_prob=alt_prob)
     return preds
 
 
@@ -270,7 +283,8 @@ def run_cv(args) -> None:
     text = load_features(args.feature_dir, args.encoder, "train", train["instruction"])
     extra = load_extra(args, args.extra_encoder, "train", train)
     alt = load_features(args.feature_dir, args.paraphrase_encoder, "train", train["instruction"]) if args.paraphrase_encoder else None
-    variants = VARIANTS + (("l1_paraphrase",) if alt is not None else ())
+    aug = load_features(args.feature_dir, args.augment_encoder, "train", train["instruction"]) if args.augment_encoder else None
+    variants = VARIANTS + (("l1_paraphrase",) if alt is not None else ()) + (("l1_blank",) if args.blank_test else ())
     folds = scene_folds(train["scene_name"], k=args.folds)
     if len(np.unique(folds)) != args.folds:
         raise ValueError(f"some of the {args.folds} scene folds are empty")
@@ -293,7 +307,8 @@ def run_cv(args) -> None:
                              history_state=state, text_dropout=args.text_dropout,
                              extra_train=None if extra is None else extra[~held],
                              extra_test=None if extra is None else extra[held],
-                             alt_text_test=None if alt is None else alt[held])
+                             alt_text_test=None if alt is None else alt[held], blank_test=args.blank_test,
+                             alt_text_train=None if aug is None else aug[~held], alt_prob=args.augment_prob)
             for v in variants:
                 oof[v][si][:, held] = preds[v]
     elapsed = time.monotonic() - start
@@ -310,7 +325,8 @@ def run_cv(args) -> None:
     name = ("l1" if args.fusion == "concat" else "l2") + ("-p2" if args.pretrain_epochs else "")
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-{name}-{args.encoder}-cv"
     config = {"stage": "cv", "model": MODEL_NAMES[args.fusion], "fusion": args.fusion, "extra_encoder": args.extra_encoder,
-              "paraphrase_encoder": args.paraphrase_encoder,
+              "paraphrase_encoder": args.paraphrase_encoder, "blank_test": args.blank_test,
+              "augment_encoder": args.augment_encoder, "augment_prob": args.augment_prob if args.augment_encoder else 0.0,
               "baseline": "h1-mlp-ca-residual", "encoder": args.encoder, "encoder_hf_id": ENCODERS[args.encoder],
               "split": "train", "folds": args.folds, "fold_rule": "scene_folds (md5 of scene name)",
               "seeds": args.seeds, "epochs_max": args.epochs, "eval_every": args.eval_every,
@@ -335,6 +351,10 @@ def run_cv(args) -> None:
         record["paraphrase"] = {"encoder": args.paraphrase_encoder, "ade": float(ades["l1_paraphrase"].mean()),
                                 "cost": paired_delta(ades["l1_paraphrase"], ades["l1"], train["scene_name"], seed=args.seeds[0]),
                                 "delta_ade": paired_delta(ades["h1"], ades["l1_paraphrase"], train["scene_name"], seed=args.seeds[0])}
+    if args.blank_test:  # ADE of L with a blank instruction minus with its own (positive: the instruction helps)
+        record["blank"] = {"ade": float(ades["l1_blank"].mean()),
+                           "cost": paired_delta(ades["l1_blank"], ades["l1"], train["scene_name"], seed=args.seeds[0]),
+                           "delta_ade": paired_delta(ades["h1"], ades["l1_blank"], train["scene_name"], seed=args.seeds[0])}
     write_run(args.output_dir / run_id, record, config, args.seeds)
     save_preds(args.output_dir / run_id, "oof", picked)
     print(json.dumps({k: record[k] for k in ("run_id", "selected_epoch", "epoch_at_cap")}, indent=2))
@@ -365,6 +385,8 @@ def run_val(args) -> None:
     val = load_cache(args.cache_dir / "val.npz")
     text_train = load_features(args.feature_dir, encoder, "train", train["instruction"])
     text_val = load_features(args.feature_dir, encoder, "val", val["instruction"])
+    aug_name, aug_prob = cv["config"].get("augment_encoder"), cv["config"].get("augment_prob", 0.0)
+    aug_train = load_features(args.feature_dir, aug_name, "train", train["instruction"]) if aug_name else None
     extra_train, extra_val = load_extra(args, extra_name, "train", train), load_extra(args, extra_name, "val", val)
 
     start = time.monotonic()
@@ -374,7 +396,7 @@ def run_val(args) -> None:
         state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
         out = fit_pair(train, text_train, val, text_val, cfg, seed, checkpoints, shuffle_seed=seed,
                        fusion=fusion, history_state=state, text_dropout=text_dropout,
-                       extra_train=extra_train, extra_test=extra_val)
+                       extra_train=extra_train, extra_test=extra_val, alt_text_train=aug_train, alt_prob=aug_prob)
         for v in VARIANTS:
             epoch = epochs["h1" if v == "h1" else "l1"]
             preds[v].append(out[v][checkpoints.index(epoch)])
@@ -388,7 +410,8 @@ def run_val(args) -> None:
               "extra_encoder": extra_name,
               "baseline": cv["config"]["baseline"], "encoder": encoder,
               "encoder_hf_id": ENCODERS[encoder], "split": "val", "seeds": seeds, "epochs": epochs,
-              "pretrain_epochs": pretrain_epochs, "text_dropout": text_dropout, **cfg}
+              "pretrain_epochs": pretrain_epochs, "text_dropout": text_dropout,
+              "augment_encoder": aug_name, "augment_prob": aug_prob, **cfg}
     caches = [args.cache_dir / f"{s}.npz" for s in ("train", "val")] + ([args.windows] if pretrain_epochs else [])
     record = {
         "run_id": run_id, **provenance(args, caches,
@@ -434,6 +457,9 @@ def run_test(args) -> None:
         raise ValueError("the test cache must not hold future poses")
     text_train = load_features(args.feature_dir, encoder, "train", train["instruction"])
     text_test = load_features(args.feature_dir, encoder, "test", test["instruction"])
+    aug_name, aug_prob = cv["config"].get("augment_encoder"), cv["config"].get("augment_prob", 0.0)
+    aug_train = (torch.as_tensor(load_features(args.feature_dir, aug_name, "train", train["instruction"]), dtype=torch.float32)
+                 if aug_name else None)
     extra_name = cv["config"].get("extra_encoder")
     extra_train, extra_test = load_extra(args, extra_name, "train", train), load_extra(args, extra_name, "test", test)
     x, base, y = prepare(train)
@@ -451,7 +477,8 @@ def run_test(args) -> None:
         preds["h1"].append(train_eval(h1, x, base, y, {"t": (tx, tbase)}, cfg, seed, [epochs["h1"]])["t"][0])
         preds["l1"].append(train_eval(lm, join(x, text_train), base, y, {"t": (join(tx, text_test), tbase)},
                                       cfg, seed, [epochs["l1"]], text_dropout=text_dropout,
-                                      text_start=HISTORY_DIM + extra_dim)["t"][0])
+                                      text_start=HISTORY_DIM + extra_dim, text_alt=aug_train,
+                                      alt_prob=aug_prob)["t"][0])
     elapsed = time.monotonic() - start
 
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-submission-v{args.version}"
@@ -475,7 +502,8 @@ def run_test(args) -> None:
     config = {"stage": "test", "purpose": "submission", "from_cv": args.from_cv, "model": cv["config"]["model"],
               "extra_encoder": extra_name,
               "fusion": fusion, "encoder": encoder, "seeds": seeds, "epochs": epochs, "pretrain_epochs": pretrain_epochs,
-              "text_dropout": text_dropout, "policy": "first instruction per scene, mean trajectory over seeds",
+              "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob,
+              "policy": "first instruction per scene, mean trajectory over seeds",
               "team": args.team, "version": args.version, **cfg}
     caches = [args.cache_dir / f"{s}.npz" for s in ("train", "test")] + ([args.windows] if pretrain_epochs else [])
     record = {"run_id": run_id, **provenance(args, caches, [args.feature_dir / f"{encoder}_{s}.npy" for s in ("train", "test")]),
@@ -508,6 +536,11 @@ def main() -> None:
     cv.add_argument("--text-dropout", type=float, default=0.0)
     cv.add_argument("--paraphrase-encoder", default=None,
                     help="text features of the same instructions said differently; adds a robustness evaluation")
+    cv.add_argument("--augment-encoder", default=None,
+                    help="text features of the same training instructions said differently, swapped in during training")
+    cv.add_argument("--augment-prob", type=float, default=0.0, help="share of training rows that use --augment-encoder")
+    cv.add_argument("--blank-test", action="store_true",
+                    help="also evaluate the language model with every instruction blank (robustness, not training)")
     cv.add_argument("--extra-encoder", choices=list(ENCODERS), default=None,
                     help="non language input given to both models (e.g. map); needs --fusion film")
     val = sub.add_parser("val", help="one-time val evaluation at the epochs a CV run picked")

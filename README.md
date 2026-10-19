@@ -71,13 +71,17 @@ python scripts/run_l1.py --run-id l2-p2-cv --baseline-run l1-cv cv --fusion film
 # submitted config: L3 + map. Qwen2.5-3B-Instruct turns each instruction into a structured intent
 # (one GPU, fp16), a 26 dim one-hot vector enters H1 through FiLM; the 17 lane map features enter
 # both models, so the history only model is H2 = history + map. Pretraining 1000 epochs (P2).
+# Version 1 also trains with paraphrase augmentation: for 30% of the training rows the intent of a
+# rewrite of the instruction (same model, same meaning) replaces the original intent.
 # Map features need the nuScenes map expansion v1.3 under data/nuscenes/maps/expansion; they are
 # written next to the text features, where run_l1.py looks for every input by default.
 python scripts/build_map_features.py --nusc-root data/nuscenes --splits train val --feature-dir data/features/text
 python scripts/language/extract_intent.py --splits train val --out-dir results/runs/intent-3b
 python scripts/language/encode_intent.py results/runs/intent-3b --splits train val
+python scripts/language/extract_intent.py --splits train --paraphrase --out-dir results/runs/intentpara-3b
+python scripts/language/encode_intent.py results/runs/intentpara-3b --splits train --name intentpara
 python scripts/run_l1.py --run-id l3map-cv --baseline-run l1-cv cv --encoder intent --fusion film --extra-encoder map \
-    --text-dropout 0.3 --pretrain-epochs 1000 --epochs 600
+    --text-dropout 0.3 --pretrain-epochs 1000 --epochs 600 --augment-encoder intentpara --augment-prob 0.3
 python scripts/run_l1.py --run-id l3map-val val --from-cv l3map-cv                                               # once
 
 # submission file, named as the upload form requires, validated on write
@@ -85,8 +89,8 @@ python scripts/build_cache.py --nusc-root data/nuscenes --split test --purpose s
 python scripts/build_map_features.py --nusc-root data/nuscenes --splits test --purpose submission --feature-dir data/features/text
 python scripts/language/extract_intent.py --splits test --purpose submission --out-dir results/runs/intent-3b
 python scripts/language/encode_intent.py results/runs/intent-3b --splits test --purpose submission
-python scripts/run_l1.py test --from-cv l3map-cv --team DHN --version 0   # DHN_CSV_version0.csv + DHN_CSV_version0_historyonly.csv
-python scripts/validate_submission.py data/submissions/<run_id>/DHN_CSV_version0.csv --team DHN --test-cache data/cache/test.npz
+python scripts/run_l1.py test --from-cv l3map-cv --team DHN --version 1   # DHN_CSV_version1.csv + DHN_CSV_version1_historyonly.csv
+python scripts/validate_submission.py data/submissions/<run_id>/DHN_CSV_version1.csv --team DHN --test-cache data/cache/test.npz
 # kinematic baselines only: python scripts/make_submission.py --model ca --team DHN --version 0
 ```
 
@@ -95,9 +99,9 @@ the sha256 of its inputs.
 
 ## Results
 
-Submission version 0 is the first row: both files are uploaded in one Language + History entry,
-`DHN_CSV_version0.csv` from the language model and `DHN_CSV_version0_historyonly.csv` (empty
-instruction column) from its history only model with the same network and non language input.
+Submission version 1 is the first row and version 0 the second: each upload is one Language + History
+entry with `DHN_CSV_version<N>.csv` from the language model and `DHN_CSV_version<N>_historyonly.csv`
+(empty instruction column) from its history only model with the same network and non language input.
 Test scores are computed by the organisers.
 
 <!-- results:start -->
@@ -108,6 +112,7 @@ means the instruction helps. 95% interval: bootstrap over scenes.
 
 | Model | ADE (instruction) | ADE (history only) | ΔADE [95% CI] | ΔADE, one trajectory per scene | Seeds |
 |---|---|---|---|---|---|
+| l2-film-frozen-text, intent + map (both models), P2 pretraining 1000 epochs, intentpara augmentation p = 0.3 | 2.831 | 2.826 | -0.005 [-0.06, +0.07] | -0.012 | 3 |
 | l2-film-frozen-text, intent + map (both models), P2 pretraining 1000 epochs | 2.853 | 2.826 | -0.027 [-0.12, +0.03] | -0.053 | 3 |
 | l2-film-frozen-text, minilm, P2 pretraining 300 epochs | 2.725 | 2.699 | -0.026 [-0.15, +0.10] | -0.045 | 3 |
 | l1-concat-frozen-text, minilm | 3.810 | 3.069 | -0.740 [-1.16, -0.47] | -0.794 | 3 |
