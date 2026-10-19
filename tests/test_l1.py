@@ -204,6 +204,23 @@ def test_intent_one_hot_layout() -> None:
     assert not enc.one_hot(None).any()  # unparsed intent = blank instruction
 
 
+def test_intent_parser_matches_one_hot_vocabulary() -> None:
+    import importlib.util
+    from pathlib import Path
+    mods = {}
+    for name in ("extract_intent", "encode_intent"):
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).resolve().parents[1] / f"scripts/language/{name}.py")
+        mods[name] = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mods[name])
+    ext, enc = mods["extract_intent"], mods["encode_intent"]
+    assert ext.MANEUVERS == enc.MANEUVERS and ext.SPEEDS == enc.SPEEDS
+    out = ext.parse('Sure: {"maneuver": "stop", "then": "turn_right", "speed": "stop", "wait_first": false}')
+    assert out["then"] == "turn_right" and enc.one_hot(out).sum() == 3
+    assert ext.parse('{"maneuver": "fly", "speed": "keep"}') is None
+    assert ext.parse("no json") is None
+
+
 def test_film_with_extra_inputs_starts_as_its_matched_baseline() -> None:
     runner = _run_l1()
     features, base = prepare_inputs(history_cache())

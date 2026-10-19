@@ -62,18 +62,30 @@ python scripts/run_baseline.py --model ca --split val
 python scripts/run_h1_cv.py cv --run-id h1-cv
 python scripts/run_h1_cv.py final --selection results/runs/h1-cv/selection.json --run-id h1-final
 
-# language models paired with their H1 (same network, rows, batches, seeds): ΔADE and shuffle test.
-# Submitted config: L2 (FiLM on the last hidden layer, 30% blank instructions) on an H1 pretrained
-# for 300 epochs on the sliding windows (P2), epochs picked by 5 fold cross validation by scene
+# language models paired with their history only model (same network, rows, batches, seeds):
+# ΔADE and shuffle test; L1 concat and L2 FiLM read a frozen MiniLM sentence embedding
 python scripts/language/encode_text.py --encoders minilm --splits train val
 python scripts/run_l1.py --run-id l1-cv cv --encoder minilm --seeds 0 1 2                                        # L1 baseline run
 python scripts/run_l1.py --run-id l2-p2-cv --baseline-run l1-cv cv --fusion film --text-dropout 0.3 --pretrain-epochs 300
-python scripts/run_l1.py val --from-cv l2-p2-cv                                                                  # once
+
+# submitted config: L3 + map. Qwen2.5-3B-Instruct turns each instruction into a structured intent
+# (one GPU, fp16), a 26 dim one-hot vector enters H1 through FiLM; the 17 lane map features enter
+# both models, so the history only model is H2 = history + map. Pretraining 1000 epochs (P2).
+# Map features need the nuScenes map expansion v1.3 under data/nuscenes/maps/expansion; they are
+# written next to the text features, where run_l1.py looks for every input by default.
+python scripts/build_map_features.py --nusc-root data/nuscenes --splits train val --feature-dir data/features/text
+python scripts/language/extract_intent.py --splits train val --out-dir results/runs/intent-3b
+python scripts/language/encode_intent.py results/runs/intent-3b --splits train val
+python scripts/run_l1.py --run-id l3map-cv --baseline-run l1-cv cv --encoder intent --fusion film --extra-encoder map \
+    --text-dropout 0.3 --pretrain-epochs 1000 --epochs 600
+python scripts/run_l1.py --run-id l3map-val val --from-cv l3map-cv                                               # once
 
 # submission file, named as the upload form requires, validated on write
 python scripts/build_cache.py --nusc-root data/nuscenes --split test --purpose submission
-python scripts/language/encode_text.py --encoders minilm --splits test --purpose submission
-python scripts/run_l1.py test --from-cv l2-p2-cv --team DHN --version 0   # DHN_CSV_version0.csv + DHN_CSV_version0_historyonly.csv
+python scripts/build_map_features.py --nusc-root data/nuscenes --splits test --purpose submission --feature-dir data/features/text
+python scripts/language/extract_intent.py --splits test --purpose submission --out-dir results/runs/intent-3b
+python scripts/language/encode_intent.py results/runs/intent-3b --splits test --purpose submission
+python scripts/run_l1.py test --from-cv l3map-cv --team DHN --version 0   # DHN_CSV_version0.csv + DHN_CSV_version0_historyonly.csv
 python scripts/validate_submission.py data/submissions/<run_id>/DHN_CSV_version0.csv --team DHN --test-cache data/cache/test.npz
 # kinematic baselines only: python scripts/make_submission.py --model ca --team DHN --version 0
 ```
@@ -83,9 +95,10 @@ the sha256 of its inputs.
 
 ## Results
 
-Submission version 0 is the first row: the language model in the Language + History track and its
-history only model (same network and non language input) in the Ablation track. Test scores are
-computed by the organisers.
+Submission version 0 is the first row: both files are uploaded in one Language + History entry,
+`DHN_CSV_version0.csv` from the language model and `DHN_CSV_version0_historyonly.csv` (empty
+instruction column) from its history only model with the same network and non language input.
+Test scores are computed by the organisers.
 
 <!-- results:start -->
 Official nuScenes validation split (339 instruction, scene pairs, 112 scenes), evaluated once per
@@ -95,8 +108,9 @@ means the instruction helps. 95% interval: bootstrap over scenes.
 
 | Model | ADE (instruction) | ADE (history only) | ΔADE [95% CI] | ΔADE, one trajectory per scene | Seeds |
 |---|---|---|---|---|---|
-| l2-film-frozen-text, P2 pretraining 300 epochs | 2.725 | 2.699 | -0.026 [-0.15, +0.10] | -0.045 | 3 |
-| l1-concat-frozen-text | 3.810 | 3.069 | -0.740 [-1.16, -0.47] | -0.794 | 3 |
+| l2-film-frozen-text, intent + map (both models), P2 pretraining 1000 epochs | 2.853 | 2.826 | -0.027 [-0.12, +0.03] | -0.053 | 3 |
+| l2-film-frozen-text, minilm, P2 pretraining 300 epochs | 2.725 | 2.699 | -0.026 [-0.15, +0.10] | -0.045 | 3 |
+| l1-concat-frozen-text, minilm | 3.810 | 3.069 | -0.740 [-1.16, -0.47] | -0.794 | 3 |
 <!-- results:end -->
 
 ## License
