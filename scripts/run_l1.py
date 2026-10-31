@@ -49,6 +49,7 @@ from drivex26.h1 import HistoryMLP, predict, prepare
 from drivex26.h1_training import select_epoch
 from drivex26.l1 import HISTORY_DIM, InstructionMLP, with_text
 from drivex26.l2 import FiLMMLP
+from drivex26.mirror import mirror_specs
 from drivex26.metrics import ade, evaluate, instruction_category, paired_delta, scene_folds
 from drivex26.submission import first_per_scene, mean_per_scene
 from drivex26.text import ENCODERS, load_features, shuffle_across_scenes
@@ -56,7 +57,8 @@ from drivex26.text import ENCODERS, load_features, shuffle_across_scenes
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ("scripts/run_l1.py", "src/drivex26/l1.py", "src/drivex26/l2.py", "src/drivex26/h1.py", "src/drivex26/text.py",
            "src/drivex26/baselines.py", "src/drivex26/data.py", "src/drivex26/metrics.py",
-           "src/drivex26/h1_training.py", "src/drivex26/submission.py")
+           "src/drivex26/h1_training.py", "src/drivex26/submission.py", "src/drivex26/mirror.py",
+           "src/drivex26/map_features.py")
 VARIANTS = ("h1", "l1", "l1_shuffled")
 POLICIES = {"first": first_per_scene, "mean": mean_per_scene}
 FUSIONS = {"concat": InstructionMLP, "film": FiLMMLP}
@@ -97,19 +99,24 @@ def seed_everything(seed: int) -> None:
 
 def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints: list[int],
                text_dropout: float = 0.0, text_start: int = HISTORY_DIM,
-               text_alt: torch.Tensor | None = None, alt_prob: float = 0.0) -> dict:
+               text_alt: torch.Tensor | None = None, alt_prob: float = 0.0, mirror: tuple | None = None) -> dict:
     """Train like scripts/run_h1.py (fixed budget, no early stopping); return {name: (C, N) preds}.
 
     `evals` maps a name to (features, base) evaluated at every epoch in `checkpoints` (0: before
     training). `text_dropout` zeroes the text columns (from `text_start`) of that share of training rows, drawn from
     its own generator so the batch order stays the one of H1. `text_alt` holds other text columns for the
     same rows (e.g. the intent of a paraphrase); that share `alt_prob` of training rows uses them instead,
-    drawn from a third generator, before the dropout.
+    drawn from a third generator, before the dropout. `mirror` (perm, sign of drivex26.mirror) flips half of the
+    training rows left to right (input columns, y of the CA base and of the target), from a fourth generator.
     """
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=cfg["lr"],
+                                  weight_decay=cfg["weight_decay"])
     generator = torch.Generator().manual_seed(seed)
     drop_gen = torch.Generator().manual_seed(seed + 10_000)
     alt_gen = torch.Generator().manual_seed(seed + 20_000)
+    mirror_gen = torch.Generator().manual_seed(seed + 30_000)
+    if mirror is not None:
+        perm, sign = torch.as_tensor(mirror[0]), torch.as_tensor(mirror[1])
     out = {name: [] for name in evals}
     if 0 in checkpoints:
         for name, (ex, eb) in evals.items():
@@ -117,7 +124,7 @@ def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints
     for epoch in range(1, checkpoints[-1] + 1):
         model.train()
         for indices in torch.randperm(len(x), generator=generator).split(cfg["batch_size"]):
-            xb = x[indices]
+            xb, bb, yb = x[indices], base[indices], y[indices]
             if text_alt is not None and alt_prob > 0:
                 xb = xb.clone()
                 swap = torch.rand(len(indices), generator=alt_gen) < alt_prob
@@ -125,7 +132,13 @@ def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints
             if text_dropout > 0:
                 xb = xb.clone()
                 xb[torch.rand(len(indices), generator=drop_gen) < text_dropout, text_start:] = 0
-            loss = torch.linalg.vector_norm(model(xb, base[indices]) - y[indices], dim=-1).mean()
+            if mirror is not None:
+                flip = torch.rand(len(indices), generator=mirror_gen) < 0.5
+                xb, bb, yb = xb.clone(), bb.clone(), yb.clone()
+                xb[flip] = xb[flip][:, perm] * sign
+                bb[flip, :, 1] *= -1
+                yb[flip, :, 1] *= -1
+            loss = torch.linalg.vector_norm(model(xb, bb) - yb, dim=-1).mean()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
@@ -135,13 +148,28 @@ def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints
     return {name: np.stack(preds) for name, preds in out.items()}
 
 
-def pretrain(windows: dict, cfg: dict, seed: int, epochs: int) -> dict:
-    """H1 trained on sliding windows without instructions (P2); returns its state_dict."""
+def pretrain(windows: dict, cfg: dict, seed: int, epochs: int, cache_dir: Path | None = None) -> dict:
+    """H1 trained on sliding windows without instructions (P2); returns its state_dict.
+
+    With `cache_dir`, the state is stored under a key of the window scenes, config, seed and epochs, and
+    reused by later runs (several configs share one pretraining per fold and seed); same state, same bits."""
+    path = None
+    if cache_dir is not None:
+        key = hashlib.sha256(json.dumps({"scenes": sorted(map(str, np.unique(windows["scene_name"]))),
+                                         "n": int(len(windows["scene_name"])), "cfg": cfg, "seed": seed,
+                                         "epochs": epochs, "torch": torch.__version__}, sort_keys=True).encode()).hexdigest()[:20]
+        path = Path(cache_dir) / f"p2-{key}.pt"
+        if path.exists():
+            return torch.load(path)
     x, base, y = prepare(windows)
     seed_everything(seed)
     model = HistoryMLP(cfg["hidden"])
     train_eval(model, x, base, y, {}, cfg, seed, [epochs])
-    return {k: v.clone() for k, v in model.state_dict().items()}
+    state = {k: v.clone() for k, v in model.state_dict().items()}
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(state, path)
+    return state
 
 
 def make_pair(text_dim: int, cfg: dict, seed: int, fusion: str, extra_dim: int, history_state: dict | None):
@@ -159,13 +187,28 @@ def make_pair(text_dim: int, cfg: dict, seed: int, fusion: str, extra_dim: int, 
     return h1, lm
 
 
+def freeze_on_baseline(lm, x, base, y, cfg: dict, seed: int, extra_dim: int, history_state: dict | None,
+                       epoch: int, mirror: tuple | None = None) -> None:
+    """Head mode: the language model's history network becomes its baseline after `epoch` epochs, frozen.
+    Only the FiLM head trains, so the language model starts as that baseline and only adds a correction;
+    `x` holds the baseline input (history and extra columns, no text)."""
+    baseline, _ = make_pair(lm.text_dim, cfg, seed, "film", extra_dim, history_state)
+    train_eval(baseline, x, base, y, {}, cfg, seed, [epoch], mirror=mirror)
+    lm.history.load_state_dict(baseline.state_dict())
+    lm.history.requires_grad_(False)
+
+
 def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndarray,
              cfg: dict, seed: int, checkpoints: list[int], shuffle_seed: int,
              fusion: str = "concat", history_state: dict | None = None, text_dropout: float = 0.0,
              extra_train: np.ndarray | None = None, extra_test: np.ndarray | None = None,
              alt_text_test: np.ndarray | None = None, blank_test: bool = False,
-             alt_text_train: np.ndarray | None = None, alt_prob: float = 0.0) -> dict:
-    """Baseline and language model trained from the same start on `train`; predictions on `test`."""
+             alt_text_train: np.ndarray | None = None, alt_prob: float = 0.0, head_from: int | None = None,
+             head_lr: float | None = None, mirror: tuple | None = None) -> dict:
+    """Baseline and language model trained from the same start on `train`; predictions on `test`.
+    With `head_from`, the language model is a FiLM head (learning rate `head_lr`) on the frozen baseline of
+    that epoch. `mirror` holds the mirror_specs of both models' inputs (left / right flip of half the rows)."""
+    mirror_h1, mirror_lm = mirror or (None, None)
     x, base, y = prepare(train)
     tx, tbase, _ = prepare(test)
     extra_dim = 0 if extra_train is None else extra_train.shape[1]
@@ -174,16 +217,18 @@ def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndar
     perm = shuffle_across_scenes(test["scene_name"], seed=shuffle_seed)
     h1, lm = make_pair(text_train.shape[1], cfg, seed, fusion, extra_dim, history_state)
     join = lambda a, b: torch.cat((a, torch.as_tensor(np.asarray(b, dtype=np.float32))), 1)
-    preds = train_eval(h1, x, base, y, {"h1": (tx, tbase)}, cfg, seed, checkpoints)
+    preds = train_eval(h1, x, base, y, {"h1": (tx, tbase)}, cfg, seed, checkpoints, mirror=mirror_h1)
+    if head_from is not None:
+        freeze_on_baseline(lm, x, base, y, cfg, seed, extra_dim, history_state, head_from, mirror_h1)
     evals = {"l1": (join(tx, text_test), tbase), "l1_shuffled": (join(tx, text_test[perm]), tbase)}
     if alt_text_test is not None:  # same rows, the instruction said differently (robustness, not training)
         evals["l1_paraphrase"] = (join(tx, alt_text_test), tbase)
     if blank_test:  # same rows, no instruction: text columns zero, as in blank instruction dropout
         evals["l1_blank"] = (join(tx, np.zeros_like(text_test)), tbase)
-    preds |= train_eval(lm, join(x, text_train), base, y, evals, cfg, seed, checkpoints,
+    preds |= train_eval(lm, join(x, text_train), base, y, evals, cfg | {"lr": head_lr or cfg["lr"]}, seed, checkpoints,
                         text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim,
                         text_alt=None if alt_text_train is None else torch.as_tensor(alt_text_train, dtype=torch.float32),
-                        alt_prob=alt_prob)
+                        alt_prob=alt_prob, mirror=mirror_lm)
     return preds
 
 
@@ -286,6 +331,9 @@ def run_cv(args) -> None:
     aug = load_features(args.feature_dir, args.augment_encoder, "train", train["instruction"]) if args.augment_encoder else None
     variants = VARIANTS + (("l1_paraphrase",) if alt is not None else ()) + (("l1_blank",) if args.blank_test else ())
     folds = scene_folds(train["scene_name"], k=args.folds)
+    if args.head_from_epoch is not None and args.fusion != "film":
+        raise ValueError("--head-from-epoch needs --fusion film")
+    mirror = mirror_specs(args.encoder, args.extra_encoder) if args.mirror else None
     if len(np.unique(folds)) != args.folds:
         raise ValueError(f"some of the {args.folds} scene folds are empty")
     checkpoints = list(range(args.eval_every, args.epochs + 1, args.eval_every))
@@ -300,15 +348,16 @@ def run_cv(args) -> None:
     for si, seed in enumerate(args.seeds):
         for fold in range(args.folds):
             held = folds == fold
-            state = (pretrain(windows_without(windows, train["scene_name"][held]), cfg, seed, args.pretrain_epochs)
-                     if args.pretrain_epochs else None)
+            state = (pretrain(windows_without(windows, train["scene_name"][held]), cfg, seed, args.pretrain_epochs,
+                              args.pretrain_cache) if args.pretrain_epochs else None)
             preds = fit_pair(subset(train, ~held), text[~held], subset(train, held), text[held],
                              cfg, seed, checkpoints, shuffle_seed=seed * 100 + fold, fusion=args.fusion,
                              history_state=state, text_dropout=args.text_dropout,
                              extra_train=None if extra is None else extra[~held],
                              extra_test=None if extra is None else extra[held],
                              alt_text_test=None if alt is None else alt[held], blank_test=args.blank_test,
-                             alt_text_train=None if aug is None else aug[~held], alt_prob=args.augment_prob)
+                             alt_text_train=None if aug is None else aug[~held], alt_prob=args.augment_prob,
+                             head_from=args.head_from_epoch, head_lr=args.head_lr, mirror=mirror)
             for v in variants:
                 oof[v][si][:, held] = preds[v]
     elapsed = time.monotonic() - start
@@ -322,7 +371,8 @@ def run_cv(args) -> None:
     picked = {"h1": oof["h1"][:, best["h1"]]} | {v: oof[v][:, best["l1"]] for v in variants[1:]}
     ades = {v: ade(p, gt[None]).mean(axis=0) for v, p in picked.items()}
 
-    name = ("l1" if args.fusion == "concat" else "l2") + ("-p2" if args.pretrain_epochs else "")
+    name = (("l1" if args.fusion == "concat" else "l2") + ("-p2" if args.pretrain_epochs else "")
+            + ("-head" if args.head_from_epoch is not None else "") + ("-mirror" if args.mirror else ""))
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-{name}-{args.encoder}-cv"
     config = {"stage": "cv", "model": MODEL_NAMES[args.fusion], "fusion": args.fusion, "extra_encoder": args.extra_encoder,
               "paraphrase_encoder": args.paraphrase_encoder, "blank_test": args.blank_test,
@@ -331,6 +381,8 @@ def run_cv(args) -> None:
               "split": "train", "folds": args.folds, "fold_rule": "scene_folds (md5 of scene name)",
               "seeds": args.seeds, "epochs_max": args.epochs, "eval_every": args.eval_every,
               "pretrain_epochs": args.pretrain_epochs, "pretrain_rule": PRETRAIN_RULE if args.pretrain_epochs else None,
+              "head_from_epoch": args.head_from_epoch,
+              "head_lr": args.head_lr, "mirror": args.mirror,
               "text_dropout": args.text_dropout, **cfg}
     caches = [args.cache_dir / "train.npz"] + ([args.windows] if args.pretrain_epochs else [])
     record = {
@@ -341,6 +393,8 @@ def run_cv(args) -> None:
         "selection": "equal-scene out-of-fold ADE, mean over seeds (h1_training.select_epoch)",
         "selected_epoch": epochs,
         "epoch_at_cap": {v: e == checkpoints[-1] for v, e in epochs.items()},
+        # head mode: l1 counts head epochs on the baseline frozen at head_from_epoch; is that the epoch picked here?
+        "head_base_at_h1_epoch": None if args.head_from_epoch is None else epochs["h1"] == args.head_from_epoch,
         "cv_curve": {"epochs": checkpoints,
                      **{v: {k: [row[k] for row in c] for k in ("ade", "ade_scene")} for v, c in curve.items()}},
         "ca_ade": float(ade(prepare(train)[1].numpy(), gt).mean()),
@@ -388,6 +442,8 @@ def run_val(args) -> None:
     aug_name, aug_prob = cv["config"].get("augment_encoder"), cv["config"].get("augment_prob", 0.0)
     aug_train = load_features(args.feature_dir, aug_name, "train", train["instruction"]) if aug_name else None
     extra_train, extra_val = load_extra(args, extra_name, "train", train), load_extra(args, extra_name, "val", val)
+    head = {k: cv["config"].get(k) for k in ("head_from_epoch", "head_lr", "mirror")}
+    mirror = mirror_specs(encoder, extra_name) if head["mirror"] else None
 
     start = time.monotonic()
     preds = {v: [] for v in VARIANTS}
@@ -396,7 +452,8 @@ def run_val(args) -> None:
         state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
         out = fit_pair(train, text_train, val, text_val, cfg, seed, checkpoints, shuffle_seed=seed,
                        fusion=fusion, history_state=state, text_dropout=text_dropout,
-                       extra_train=extra_train, extra_test=extra_val, alt_text_train=aug_train, alt_prob=aug_prob)
+                       extra_train=extra_train, extra_test=extra_val, alt_text_train=aug_train, alt_prob=aug_prob,
+                       head_from=head["head_from_epoch"], head_lr=head["head_lr"], mirror=mirror)
         for v in VARIANTS:
             epoch = epochs["h1" if v == "h1" else "l1"]
             preds[v].append(out[v][checkpoints.index(epoch)])
@@ -410,8 +467,7 @@ def run_val(args) -> None:
               "extra_encoder": extra_name,
               "baseline": cv["config"]["baseline"], "encoder": encoder,
               "encoder_hf_id": ENCODERS[encoder], "split": "val", "seeds": seeds, "epochs": epochs,
-              "pretrain_epochs": pretrain_epochs, "text_dropout": text_dropout,
-              "augment_encoder": aug_name, "augment_prob": aug_prob, **cfg}
+              "pretrain_epochs": pretrain_epochs, "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob, **head, **cfg}
     caches = [args.cache_dir / f"{s}.npz" for s in ("train", "val")] + ([args.windows] if pretrain_epochs else [])
     record = {
         "run_id": run_id, **provenance(args, caches,
@@ -462,6 +518,8 @@ def run_test(args) -> None:
                  if aug_name else None)
     extra_name = cv["config"].get("extra_encoder")
     extra_train, extra_test = load_extra(args, extra_name, "train", train), load_extra(args, extra_name, "test", test)
+    head = {k: cv["config"].get(k) for k in ("head_from_epoch", "head_lr", "mirror")}
+    mirror_h1, mirror_lm = mirror_specs(encoder, extra_name) if head["mirror"] else (None, None)
     x, base, y = prepare(train)
     tx, tbase = prepare_inputs(test)
     extra_dim = 0 if extra_train is None else extra_train.shape[1]
@@ -474,11 +532,14 @@ def run_test(args) -> None:
     for seed in seeds:
         state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
         h1, lm = make_pair(text_train.shape[1], cfg, seed, fusion, extra_dim, state)
-        preds["h1"].append(train_eval(h1, x, base, y, {"t": (tx, tbase)}, cfg, seed, [epochs["h1"]])["t"][0])
+        if head["head_from_epoch"] is not None:
+            freeze_on_baseline(lm, x, base, y, cfg, seed, extra_dim, state, head["head_from_epoch"], mirror_h1)
+        preds["h1"].append(train_eval(h1, x, base, y, {"t": (tx, tbase)}, cfg, seed, [epochs["h1"]],
+                                      mirror=mirror_h1)["t"][0])
         preds["l1"].append(train_eval(lm, join(x, text_train), base, y, {"t": (join(tx, text_test), tbase)},
-                                      cfg, seed, [epochs["l1"]], text_dropout=text_dropout,
-                                      text_start=HISTORY_DIM + extra_dim, text_alt=aug_train,
-                                      alt_prob=aug_prob)["t"][0])
+                                      cfg | {"lr": head["head_lr"] or cfg["lr"]}, seed, [epochs["l1"]],
+                                      text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim,
+                                      text_alt=aug_train, alt_prob=aug_prob, mirror=mirror_lm)["t"][0])
     elapsed = time.monotonic() - start
 
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-submission-v{args.version}"
@@ -502,7 +563,7 @@ def run_test(args) -> None:
     config = {"stage": "test", "purpose": "submission", "from_cv": args.from_cv, "model": cv["config"]["model"],
               "extra_encoder": extra_name,
               "fusion": fusion, "encoder": encoder, "seeds": seeds, "epochs": epochs, "pretrain_epochs": pretrain_epochs,
-              "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob,
+              "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob, **head,
               "policy": "first instruction per scene, mean trajectory over seeds",
               "team": args.team, "version": args.version, **cfg}
     caches = [args.cache_dir / f"{s}.npz" for s in ("train", "test")] + ([args.windows] if pretrain_epochs else [])
@@ -519,6 +580,8 @@ def main() -> None:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--windows", type=Path, default=ROOT / "data" / "cache" / "windows_train.npz")
     parser.add_argument("--extra-feature-dir", type=Path, default=None, help="feature dir of --extra-encoder (default: --feature-dir)")
+    parser.add_argument("--pretrain-cache", type=Path, default=None,
+                        help="reuse P2 pretrained states across runs (same windows, config, seed, epochs); e.g. data/pretrain_cache")
     parser.add_argument("--baseline-run", default=None, help="run of the same stage whose H1 this one is compared to")
     sub = parser.add_subparsers(dest="stage", required=True)
     cv = sub.add_parser("cv", help="5-fold CV by scene on train")
@@ -534,6 +597,12 @@ def main() -> None:
     cv.add_argument("--fusion", choices=list(FUSIONS), default="concat")
     cv.add_argument("--pretrain-epochs", type=int, default=0, help="P2 pretraining on sliding windows; 0: none")
     cv.add_argument("--text-dropout", type=float, default=0.0)
+    cv.add_argument("--head-from-epoch", type=int, default=None,
+                    help="language model = FiLM head on the frozen baseline trained this many epochs "
+                         "(its CV epoch from an earlier run); needs --fusion film")
+    cv.add_argument("--head-lr", type=float, default=None, help="learning rate of the language model (default: --lr)")
+    cv.add_argument("--mirror", action="store_true",
+                    help="flip half of the fine tuning rows left to right, in both models (drivex26.mirror)")
     cv.add_argument("--paraphrase-encoder", default=None,
                     help="text features of the same instructions said differently; adds a robustness evaluation")
     cv.add_argument("--augment-encoder", default=None,

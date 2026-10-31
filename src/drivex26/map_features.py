@@ -19,6 +19,14 @@ DIM = len(NAMES)
 STEP = 0.5  # m between discretised lane poses
 HORIZON = 40.0  # m followed along the lane graph
 SCALE = 20.0  # metres are divided by this, like the history features of H1
+# v2: candidate centerlines, each sampled every 7.5 m up to 60 m: the three branches of the ego lane
+# (straightest, leftmost, rightmost) and the straightest path of the nearest lane on each side
+HORIZON2 = 60.0
+POINTS2 = tuple(7.5 * k for k in range(1, 9))
+SLOTS2 = ("ego_main", "ego_left", "ego_right", "nb_left", "nb_right")
+NAMES2 = ("has_lane", "lateral_offset", "heading_offset",
+          *(n for slot in SLOTS2 for n in (f"{slot}_valid", *(f"{slot}_{a}{int(d * 10)}" for d in POINTS2 for a in "xy"))))
+DIM2 = len(NAMES2)
 
 
 def _wrap(angle):
@@ -49,15 +57,15 @@ def _closest_lane(nmap, xy, yaw, radius: float = 5.0):
     return None if best is None else best[1:]
 
 
-def _branches(nmap, token, start, poses, max_branches: int = 8) -> list[np.ndarray]:
-    """Every path along the lane graph from poses[start], cut at HORIZON metres; list of (M, 3)."""
+def _branches(nmap, token, start, poses, max_branches: int = 8, horizon: float = HORIZON) -> list[np.ndarray]:
+    """Every path along the lane graph from poses[start], cut at `horizon` metres; list of (M, 3)."""
     out = []
     stack = [(poses[start:], token, 0)]
     while stack and len(out) < max_branches:
         path, last, depth = stack.pop()
         length = np.linalg.norm(np.diff(path[:, :2], axis=0), axis=1).sum() if len(path) > 1 else 0.0
         nxt = nmap.get_outgoing_lane_ids(last) if depth < 4 else []
-        if length >= HORIZON or not nxt:
+        if length >= horizon or not nxt:
             out.append(path)
             continue
         for lane in nxt:
@@ -98,4 +106,56 @@ def lane_features(nmap, anchor_xy: np.ndarray, anchor_yaw: float) -> np.ndarray:
               ends[int(np.argmax(ends[:, 1]))] / SCALE, ends[int(np.argmin(ends[:, 1]))] / SCALE,
               len(branches) / 4.0, min(lane_left, HORIZON) / SCALE]
     out[:] = np.concatenate([np.atleast_1d(np.asarray(v, dtype=np.float64)) for v in values])
+    return out
+
+
+def _turn(path_xy: np.ndarray) -> float:
+    """Absolute bearing (rad) of the point 30 m along a path in the anchor frame."""
+    end = _point_at(path_xy, 30.0)
+    return abs(float(np.arctan2(end[1], max(end[0], 1e-3))))
+
+
+def _neighbours(nmap, xy, yaw, ego_token, radius: float = 8.0) -> dict:
+    """{"nb_left" / "nb_right": (token, index, poses)} of the nearest lane beside the ego lane on each side:
+    heading within 30 degrees, closest pose 1.5 to 6 m to the side and less than 5 m ahead or behind."""
+    records = nmap.get_records_in_radius(xy[0], xy[1], radius, ["lane", "lane_connector"])
+    best = {}
+    for token, poses in nmap.discretize_lanes(records["lane"] + records["lane_connector"], STEP).items():
+        poses = np.asarray(poses, dtype=np.float64)
+        if token == ego_token or not len(poses):
+            continue
+        i = int(np.argmin(np.linalg.norm(poses[:, :2] - xy, axis=1)))
+        local = to_anchor_frame(poses[i:i + 1, :2], xy, yaw)[0]
+        if abs(float(_wrap(poses[i, 2] - yaw))) > np.pi / 6 or abs(local[0]) > 5.0 or not 1.5 <= abs(local[1]) <= 6.0:
+            continue
+        side = "nb_left" if local[1] > 0 else "nb_right"
+        if side not in best or abs(local[1]) < best[side][0]:
+            best[side] = (abs(local[1]), token, i, poses)
+    return {side: v[1:] for side, v in best.items()}
+
+
+def lane_features_v2(nmap, anchor_xy: np.ndarray, anchor_yaw: float) -> np.ndarray:
+    """DIM2 floats for one anchor pose: v1's lane offsets plus five candidate centerlines (map encoder v2).
+
+    Mirror symmetric by construction (leftmost and rightmost branch, nearest lane on each side), so
+    drivex26.mirror can swap the left and right slots."""
+    xy = np.asarray(anchor_xy, dtype=np.float64)
+    out = np.zeros(DIM2, dtype=np.float32)
+    found = _closest_lane(nmap, xy, anchor_yaw)
+    if found is None:
+        return out
+    token, i, poses = found
+    local = lambda p: to_anchor_frame(p[:, :2], xy, anchor_yaw)
+    paths = [local(b) for b in _branches(nmap, token, i, poses, horizon=HORIZON2)]
+    ends = np.array([_point_at(b, 30.0)[1] for b in paths])
+    slots = {"ego_main": min(paths, key=_turn), "ego_left": paths[int(np.argmax(ends))],
+             "ego_right": paths[int(np.argmin(ends))]}
+    for side, (tok, j, p) in _neighbours(nmap, xy, anchor_yaw, token).items():
+        slots[side] = min((local(b) for b in _branches(nmap, tok, j, p, horizon=HORIZON2)), key=_turn)
+    values = [1.0, local(poses[i:i + 1])[0, 1] / SCALE, float(_wrap(poses[i, 2] - anchor_yaw))]
+    for slot in SLOTS2:
+        path = slots.get(slot)
+        values += [0.0] * (1 + 2 * len(POINTS2)) if path is None else \
+            [1.0, *np.concatenate([_point_at(path, d) / SCALE for d in POINTS2])]
+    out[:] = values
     return out

@@ -303,3 +303,73 @@ def test_augmentation_swaps_text_columns_without_changing_the_batch_order() -> N
     np.testing.assert_array_equal(fit(text, text_alt=alt, alt_prob=1.0), fit(alt))  # every row swapped
     np.testing.assert_array_equal(fit(text, text_alt=alt, alt_prob=0.0), fit(text))  # off: unchanged
     assert not np.allclose(fit(text, text_alt=alt, alt_prob=0.5), fit(text))
+
+
+def test_head_mode_starts_as_the_trained_baseline_and_keeps_it_frozen() -> None:
+    runner = _run_l1()
+    cache = history_cache(8)
+    cache["fut_xy"] = np.random.default_rng(9).normal(size=(8, 12, 2)).astype(np.float32)
+    cache["scene_name"] = np.array([f"s{i % 4}" for i in range(8)])
+    extra = np.random.default_rng(10).normal(size=(8, 3)).astype(np.float32)
+    text = np.random.default_rng(11).normal(size=(8, 4)).astype(np.float32)
+    cfg = {"hidden": 8, "lr": 1e-2, "weight_decay": 1e-2, "batch_size": 4}
+    kw = dict(fusion="film", extra_train=extra, extra_test=extra, head_from=3, head_lr=1e-3)
+    preds = runner.fit_pair(cache, text, cache, text, cfg, 0, [0, 3, 5], shuffle_seed=0, **kw)
+    np.testing.assert_allclose(preds["l1"][0], preds["h1"][1], atol=1e-6)  # head epoch 0 = baseline at epoch 3
+    assert not np.allclose(preds["l1"][2], preds["h1"][1])  # the head learns
+
+    x, base, y = runner.prepare(cache)
+    x = with_text(x, extra)
+    h2, lm = runner.make_pair(4, cfg, 0, "film", 3, None)
+    runner.freeze_on_baseline(lm, x, base, y, cfg, 0, 3, None, 3)
+    frozen = {k: v.clone() for k, v in lm.history.state_dict().items()}
+    runner.train_eval(lm, torch.cat((x, torch.as_tensor(text)), 1), base, y, {}, cfg, 0, [2])
+    assert all(torch.equal(frozen[k], v) for k, v in lm.history.state_dict().items())  # weight decay skips it too
+
+
+def test_test_and_val_stages_run_a_mirror_cv_config(tmp_path) -> None:
+    import json
+    import types
+
+    from drivex26.data import save_cache
+    from drivex26.map_features import DIM
+    from drivex26.submission import validate_submission
+
+    runner = _run_l1()
+    rng = np.random.default_rng(1)
+
+    def cache(n, scenes, future=True):
+        c = {"scene_name": np.array([f"scene-{i % scenes:04d}" for i in range(n)]),
+             "scene_token": np.array([f"tok{i % scenes}" for i in range(n)]),
+             "instruction": np.array([f"go {i}" for i in range(n)]),
+             "has_static": np.zeros(n, bool), "has_dynamic": np.zeros(n, bool),
+             "hist_t": np.tile([-2.0, -1.5, -1.0, -0.5], (n, 1)).astype(np.float32),
+             "hist_xy": rng.normal(size=(n, 4, 2)).astype(np.float32)}
+        if future:  # rows of one scene share its future
+            c["fut_xy"] = rng.normal(size=(scenes, 12, 2)).astype(np.float32)[np.arange(n) % scenes]
+        return c
+
+    caches, feats, runs = tmp_path / "cache", tmp_path / "feat", tmp_path / "runs"
+    splits = {"train": cache(12, 6), "val": cache(8, 4), "test": cache(7, 3, future=False)}
+    for split, c in splits.items():
+        save_cache(c, caches / f"{split}.npz")
+        texts = [str(t) for t in c["instruction"]]
+        save_features(feats, "intent", split, np.eye(26, dtype=np.float32)[rng.integers(0, 26, len(texts))], texts, {})
+        save_features(feats, "map", split, rng.normal(size=(len(texts), DIM)).astype(np.float32), texts, {})
+    (runs / "cv").mkdir(parents=True)
+    (runs / "cv" / "metrics.json").write_text(json.dumps({
+        "config": {"stage": "cv", "model": "l2-film-frozen-text", "baseline": "h1-mlp-ca-residual", "encoder": "intent",
+                   "extra_encoder": "map", "seeds": [0], "fusion": "film", "pretrain_epochs": 0, "text_dropout": 0.3,
+                   "mirror": True, "head_from_epoch": None, "head_lr": None,
+                   "hidden": 8, "lr": 0.01, "weight_decay": 0.0, "batch_size": 4},
+        "selected_epoch": {"h1": 2, "l1": 3}, "epoch_at_cap": {"h1": False, "l1": False}, "selection": "x"}))
+    args = types.SimpleNamespace(output_dir=runs, from_cv="cv", cache_dir=caches, feature_dir=feats, extra_feature_dir=None,
+                                 windows=tmp_path / "none.npz", team="DHN", version=2, run_id="sub", out_dir=tmp_path / "out",
+                                 baseline_run=None)
+    runner.run_test(args)
+    for name in ("DHN_CSV_version2.csv", "DHN_CSV_version2_historyonly.csv"):
+        assert validate_submission(tmp_path / "out" / name, expected_tokens={"tok0", "tok1", "tok2"}, team="DHN")[0] == []
+    assert json.loads((runs / "sub" / "metrics.json").read_text())["config"]["mirror"] is True
+    args.run_id = "val"
+    runner.run_val(args)
+    assert json.loads((runs / "val" / "metrics.json").read_text())["config"]["mirror"] is True
