@@ -90,3 +90,14 @@ def test_mirror_flips_whole_rows_of_input_base_and_target() -> None:
     names = HISTORY_NAMES + NAMES + INTENT_NAMES
     np.testing.assert_allclose(xb[flipped].numpy(), flip(x[order][flipped].numpy(), names), atol=1e-6)
     np.testing.assert_allclose(xb[~flipped].numpy(), x[order][~flipped].numpy())
+
+
+def test_mapcam_mirror_swaps_image_views_and_flips_map() -> None:
+    from drivex26.map_features import NAMES
+    from drivex26.vision import K, MAPCAM_NAMES
+    perm, sign = mirror_columns(MAPCAM_NAMES)
+    n = len(NAMES)
+    assert list(perm[n:n + K]) == list(range(n + K, n + 2 * K)) and list(perm[n + K:]) == list(range(n, n + K))
+    assert (sign[n:] == 1).all()  # image views are swapped, never negated
+    base, lm = mirror_specs("intent", "mapcam")
+    assert len(base[0]) == 12 + len(MAPCAM_NAMES) and len(lm[0]) == 12 + len(MAPCAM_NAMES) + len(INTENT_NAMES)

@@ -173,7 +173,8 @@ def test_test_stage_writes_two_valid_submission_files(tmp_path) -> None:
                    "pretrain_epochs": 0, "text_dropout": 0.3, "hidden": 8, "lr": 0.01, "weight_decay": 0.0, "batch_size": 4},
         "selected_epoch": {"h1": 2, "l1": 3}, "epoch_at_cap": {"h1": False, "l1": False}, "selection": "x"}))
     args = types.SimpleNamespace(output_dir=runs, from_cv="cv", cache_dir=caches, feature_dir=feats,
-                                 windows=tmp_path / "none.npz", team="DHN", version=0, run_id="sub", out_dir=tmp_path / "out")
+                                 windows=tmp_path / "none.npz", team="DHN", version=0, run_id="sub", out_dir=tmp_path / "out",
+                                 tta=False, workers=1)
     runner.run_test(args)
     for name in ("DHN_CSV_version0.csv", "DHN_CSV_version0_historyonly.csv"):
         path = tmp_path / "out" / name
@@ -365,7 +366,7 @@ def test_test_and_val_stages_run_a_mirror_cv_config(tmp_path) -> None:
         "selected_epoch": {"h1": 2, "l1": 3}, "epoch_at_cap": {"h1": False, "l1": False}, "selection": "x"}))
     args = types.SimpleNamespace(output_dir=runs, from_cv="cv", cache_dir=caches, feature_dir=feats, extra_feature_dir=None,
                                  windows=tmp_path / "none.npz", team="DHN", version=2, run_id="sub", out_dir=tmp_path / "out",
-                                 baseline_run=None)
+                                 baseline_run=None, tta=False, workers=1)
     runner.run_test(args)
     for name in ("DHN_CSV_version2.csv", "DHN_CSV_version2_historyonly.csv"):
         assert validate_submission(tmp_path / "out" / name, expected_tokens={"tok0", "tok1", "tok2"}, team="DHN")[0] == []
@@ -373,3 +374,64 @@ def test_test_and_val_stages_run_a_mirror_cv_config(tmp_path) -> None:
     args.run_id = "val"
     runner.run_val(args)
     assert json.loads((runs / "val" / "metrics.json").read_text())["config"]["mirror"] is True
+    args.tta, args.run_id, args.out_dir = True, "val_tta", tmp_path / "out_tta"
+    runner.run_val(args)
+    assert json.loads((runs / "val_tta" / "metrics.json").read_text())["config"]["tta"] is True
+    args.run_id = "sub_tta"
+    runner.run_test(args)
+    tta_file, plain = (tmp_path / d / "DHN_CSV_version2.csv" for d in ("out_tta", "out"))
+    assert validate_submission(tta_file, expected_tokens={"tok0", "tok1", "tok2"}, team="DHN")[0] == []
+    assert tta_file.read_text() != plain.read_text()
+
+
+def test_tta_merge_averages_the_mirrored_prediction_back() -> None:
+    runner = _run_l1()
+    p = np.random.default_rng(0).normal(size=(2, 3, 12, 2)).astype(np.float32)
+    q = p * np.array([1.0, -1.0], np.float32)  # a perfectly mirror equivariant model
+    merged = runner.tta_merge({"l1": p, "l1_m": q + np.array([0.0, 0.2], np.float32)})
+    assert set(merged) == {"l1", "l1_tta"}
+    np.testing.assert_allclose(merged["l1_tta"], p - np.array([0.0, 0.1], np.float32), atol=1e-6)
+    x = torch.arange(6.0).reshape(2, 3)
+    ev = runner.tta_evals({"h1": (x, torch.ones(2, 12, 2))}, (np.array([0, 2, 1]), np.array([-1.0, 1.0, 1.0], np.float32)))
+    np.testing.assert_allclose(ev["h1_m"][0].numpy(), [[0, 2, 1], [-3, 5, 4]])
+    assert (ev["h1_m"][1][..., 1] == -1).all() and (ev["h1_m"][1][..., 0] == 1).all()
+
+
+def test_cv_with_tta_gives_the_same_bits_with_seed_workers(tmp_path) -> None:
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from drivex26.data import save_cache
+    from drivex26.map_features import DIM
+
+    rng = np.random.default_rng(2)
+    n, scenes = 30, 10
+    c = {"scene_name": np.array([f"scene-{i % scenes:04d}" for i in range(n)]),
+         "scene_token": np.array([f"tok{i % scenes}" for i in range(n)]),
+         "instruction": np.array([f"go {i}" for i in range(n)]),
+         "has_static": np.zeros(n, bool), "has_dynamic": np.zeros(n, bool),
+         "hist_t": np.tile([-2.0, -1.5, -1.0, -0.5], (n, 1)).astype(np.float32),
+         "hist_xy": rng.normal(size=(n, 4, 2)).astype(np.float32),
+         "fut_xy": rng.normal(size=(scenes, 12, 2)).astype(np.float32)[np.arange(n) % scenes]}
+    save_cache(c, tmp_path / "cache" / "train.npz")
+    texts = [str(t) for t in c["instruction"]]
+    save_features(tmp_path / "feat", "intent", "train", np.eye(26, dtype=np.float32)[rng.integers(0, 26, n)], texts, {})
+    save_features(tmp_path / "feat", "map", "train", rng.normal(size=(n, DIM)).astype(np.float32), texts, {})
+    root = Path(__file__).resolve().parents[1]
+    metrics = []
+    for workers in (1, 2):
+        run = f"w{workers}"
+        subprocess.run([sys.executable, str(root / "scripts/run_l1.py"), "--cache-dir", str(tmp_path / "cache"),
+                        "--feature-dir", str(tmp_path / "feat"), "--output-dir", str(tmp_path / "runs"), "--run-id", run,
+                        "--workers", str(workers), "cv", "--encoder", "intent", "--fusion", "film", "--extra-encoder", "map",
+                        "--text-dropout", "0.3", "--mirror", "--tta", "--seeds", "0", "1", "2", "3", "--folds", "2",
+                        "--epochs", "4", "--eval-every", "2", "--hidden", "8", "--batch-size", "8"],
+                       check=True, capture_output=True)
+        metrics.append(json.loads((tmp_path / "runs" / run / "metrics.json").read_text()))
+    for key in ("metrics", "ensemble", "selected_epoch"):
+        assert metrics[0][key] == metrics[1][key]
+    ens = metrics[0]["ensemble"]
+    assert set(ens["all"]["ade"]) == {"h1", "l1", "h1_tta", "l1_tta"} and ens["first3"]["seeds"] == [0, 1, 2]
+    assert set(ens["l1_vs_first3"]) == {"l1", "l1_tta"}

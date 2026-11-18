@@ -85,6 +85,9 @@ python scripts/language/encode_intent.py results/runs/intentpara-3b --splits tra
 python scripts/run_l1.py --run-id l3map-cv --baseline-run l1-cv cv --encoder intent --fusion film --extra-encoder map \
     --text-dropout 0.3 --pretrain-epochs 2000 --epochs 600 --mirror
 python scripts/run_l1.py --run-id l3map-val val --from-cv l3map-cv                                               # once
+# Optional: --workers N trains the seeds in N processes (same results bit for bit); with --mirror,
+# --tta also averages each prediction with the mirrored input's prediction flipped back. A 6 seed
+# run with --tta was compared on validation after the challenge and not submitted (worse than version 2).
 
 # submission file, named as the upload form requires, validated on write
 python scripts/build_cache.py --nusc-root data/nuscenes --split test --purpose submission

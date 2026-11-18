@@ -12,6 +12,7 @@ import re
 import numpy as np
 
 from drivex26.map_features import NAMES, NAMES2
+from drivex26.vision import MAPCAM_NAMES
 
 HISTORY_NAMES = (*(f"{a}{k}" for k in range(4) for a in ("x", "y")), *(f"t{k}" for k in range(4)))
 # Column layout of scripts/language/encode_intent.py (L3 one-hot, 26 columns)
@@ -19,7 +20,7 @@ MANEUVERS = ("go_straight", "turn_left", "turn_right", "lane_change_left", "lane
              "slow_down", "follow", "u_turn", "other")
 INTENT_NAMES = (*(f"m_{m}" for m in MANEUVERS), *(f"then_{m}" for m in MANEUVERS), "then_none",
                 *(f"speed_{s}" for s in ("stop", "slow", "keep", "faster")), "wait_first")
-COLUMNS = {"intent": INTENT_NAMES, "map": NAMES, "map2": NAMES2}
+COLUMNS = {"intent": INTENT_NAMES, "map": NAMES, "map2": NAMES2, "mapcam": MAPCAM_NAMES}
 LATERAL = re.compile(r"(.*_)?y\d+|.*_offset")
 
 

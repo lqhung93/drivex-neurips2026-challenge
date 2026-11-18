@@ -32,12 +32,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
+import multiprocessing
 import hashlib
 import json
 import os
 import random
 import subprocess
 import time
+from concurrent.futures import ProcessPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -95,6 +98,43 @@ def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def init_worker() -> None:
+    torch.use_deterministic_algorithms(True)
+    torch.set_num_threads(1)
+
+
+def seed_map(fn, seeds: list[int], workers: int) -> list:
+    """fn(seed) for every seed; with workers > 1 in spawned processes of one thread each. Every seed seeds its own
+    generators and models, so the result is the same bits as the sequential loop."""
+    if workers <= 1:
+        return [fn(seed) for seed in seeds]
+    with ProcessPoolExecutor(min(workers, len(seeds)), mp_context=multiprocessing.get_context("spawn"),
+                             initializer=init_worker) as pool:
+        return list(pool.map(fn, seeds))
+
+
+def tta_evals(evals: dict, spec: tuple) -> dict:
+    """Mirror test time augmentation: each eval also on its left / right mirror (drivex26.mirror spec), as `<name>_m`."""
+    perm, sign = torch.as_tensor(spec[0]), torch.as_tensor(spec[1])
+    out = dict(evals)
+    for name, (ex, eb) in evals.items():
+        mb = eb.clone()
+        mb[..., 1] *= -1
+        out[f"{name}_m"] = (ex[:, perm] * sign, mb)
+    return out
+
+
+def tta_merge(preds: dict) -> dict:
+    """`<name>_m` predictions mirrored back and averaged with `<name>` into `<name>_tta`."""
+    out = {k: v for k, v in preds.items() if not k.endswith("_m")}
+    for name in list(out):
+        if f"{name}_m" in preds:
+            back = preds[f"{name}_m"].copy()
+            back[..., 1] *= -1
+            out[f"{name}_tta"] = (out[name] + back) / 2
+    return out
 
 
 def train_eval(model, x, base, y, evals: dict, cfg: dict, seed: int, checkpoints: list[int],
@@ -204,8 +244,9 @@ def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndar
              extra_train: np.ndarray | None = None, extra_test: np.ndarray | None = None,
              alt_text_test: np.ndarray | None = None, blank_test: bool = False,
              alt_text_train: np.ndarray | None = None, alt_prob: float = 0.0, head_from: int | None = None,
-             head_lr: float | None = None, mirror: tuple | None = None) -> dict:
+             head_lr: float | None = None, mirror: tuple | None = None, tta: bool = False) -> dict:
     """Baseline and language model trained from the same start on `train`; predictions on `test`.
+    With `tta`, every prediction also comes as `<name>_tta`, the mean with the mirrored input (needs `mirror`).
     With `head_from`, the language model is a FiLM head (learning rate `head_lr`) on the frozen baseline of
     that epoch. `mirror` holds the mirror_specs of both models' inputs (left / right flip of half the rows)."""
     mirror_h1, mirror_lm = mirror or (None, None)
@@ -217,7 +258,11 @@ def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndar
     perm = shuffle_across_scenes(test["scene_name"], seed=shuffle_seed)
     h1, lm = make_pair(text_train.shape[1], cfg, seed, fusion, extra_dim, history_state)
     join = lambda a, b: torch.cat((a, torch.as_tensor(np.asarray(b, dtype=np.float32))), 1)
-    preds = train_eval(h1, x, base, y, {"h1": (tx, tbase)}, cfg, seed, checkpoints, mirror=mirror_h1)
+    if tta and mirror is None:
+        raise ValueError("mirror test time augmentation needs the mirror specs")
+    h1_evals = {"h1": (tx, tbase)}
+    preds = train_eval(h1, x, base, y, tta_evals(h1_evals, mirror_h1) if tta else h1_evals, cfg, seed, checkpoints,
+                       mirror=mirror_h1)
     if head_from is not None:
         freeze_on_baseline(lm, x, base, y, cfg, seed, extra_dim, history_state, head_from, mirror_h1)
     evals = {"l1": (join(tx, text_test), tbase), "l1_shuffled": (join(tx, text_test[perm]), tbase)}
@@ -225,11 +270,11 @@ def fit_pair(train: dict, text_train: np.ndarray, test: dict, text_test: np.ndar
         evals["l1_paraphrase"] = (join(tx, alt_text_test), tbase)
     if blank_test:  # same rows, no instruction: text columns zero, as in blank instruction dropout
         evals["l1_blank"] = (join(tx, np.zeros_like(text_test)), tbase)
-    preds |= train_eval(lm, join(x, text_train), base, y, evals, cfg | {"lr": head_lr or cfg["lr"]}, seed, checkpoints,
+    preds |= train_eval(lm, join(x, text_train), base, y, tta_evals(evals, mirror_lm) if tta else evals, cfg | {"lr": head_lr or cfg["lr"]}, seed, checkpoints,
                         text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim,
                         text_alt=None if alt_text_train is None else torch.as_tensor(alt_text_train, dtype=torch.float32),
                         alt_prob=alt_prob, mirror=mirror_lm)
-    return preds
+    return tta_merge(preds) if tta else preds
 
 
 def load_extra(args, name: str | None, split: str, cache: dict) -> np.ndarray | None:
@@ -322,6 +367,46 @@ def provenance(args, cache_paths: list[Path], feature_paths: list[Path]) -> dict
     }
 
 
+def cv_seed(seed: int, *, args, train, text, extra, alt, aug, folds, windows, cfg, checkpoints, variants, mirror) -> dict:
+    """Out-of-fold predictions {variant: (C, N, 12, 2)} of one seed over every fold."""
+    out = {v: np.zeros((len(checkpoints), *train["fut_xy"].shape), np.float32) for v in variants}
+    for fold in range(args.folds):
+        held = folds == fold
+        state = (pretrain(windows_without(windows, train["scene_name"][held]), cfg, seed, args.pretrain_epochs,
+                          args.pretrain_cache) if args.pretrain_epochs else None)
+        preds = fit_pair(subset(train, ~held), text[~held], subset(train, held), text[held],
+                         cfg, seed, checkpoints, shuffle_seed=seed * 100 + fold, fusion=args.fusion,
+                         history_state=state, text_dropout=args.text_dropout,
+                         extra_train=None if extra is None else extra[~held],
+                         extra_test=None if extra is None else extra[held],
+                         alt_text_test=None if alt is None else alt[held], blank_test=args.blank_test,
+                         alt_text_train=None if aug is None else aug[~held], alt_prob=args.augment_prob,
+                         head_from=args.head_from_epoch, head_lr=args.head_lr, mirror=mirror, tta=args.tta)
+        for v in variants:
+            out[v][:, held] = preds[v]
+    return out
+
+
+def ensemble_report(oof: dict, picked: dict, cache: dict, checkpoints: list[int], seeds: list[int]) -> dict:
+    """OOF ADE of the seed-mean trajectory, the one a submission file holds (metrics.ade is the mean of per-seed ADE).
+
+    `all`: every seed at this run's epochs; `first3`: seeds[:3] at the epochs those seeds alone pick, i.e. what a
+    3-seed run of the same config submits; `l1_vs_first3`: paired gain of each L variant over first3 L."""
+    gt, groups = cache["fut_xy"], cache["scene_name"]
+    rows = {v: ade(p.mean(axis=0), gt) for v, p in picked.items() if v != "l1_shuffled"}
+    out = {"all": {"seeds": seeds, "ade": {v: float(r.mean()) for v, r in rows.items()}}}
+    if len(seeds) > 3:
+        first = {}
+        for v in ("h1", "l1"):
+            epoch, _ = select_epoch(ade(oof[v][:3], gt[None, None]), checkpoints, groups)
+            first[v] = ade(oof[v][:3, checkpoints.index(epoch)].mean(axis=0), gt)
+            out.setdefault("first3", {"seeds": seeds[:3], "epoch": {}, "ade": {}})
+            out["first3"]["epoch"][v], out["first3"]["ade"][v] = epoch, float(first[v].mean())
+        out["l1_vs_first3"] = {v: paired_delta(first["l1"], rows[v], groups, seed=seeds[0])
+                               for v in rows if v.startswith("l1")}
+    return out
+
+
 def run_cv(args) -> None:
     assert_split_allowed("train", "train")
     train = load_cache(args.cache_dir / "train.npz")
@@ -337,29 +422,22 @@ def run_cv(args) -> None:
     if len(np.unique(folds)) != args.folds:
         raise ValueError(f"some of the {args.folds} scene folds are empty")
     checkpoints = list(range(args.eval_every, args.epochs + 1, args.eval_every))
+    windows = None
     if args.pretrain_epochs:
         checkpoints = [0] + checkpoints  # epoch 0: pretrained only, no fine tuning
         windows = load_cache(args.windows)
     cfg = {k: getattr(args, k) for k in ("hidden", "lr", "weight_decay", "batch_size")}
 
+    if args.tta and mirror is None:
+        raise ValueError("--tta needs --mirror")
+    variants += ("h1_tta", "l1_tta") if args.tta else ()
+
     start = time.monotonic()
     # oof[variant][seed] -> (C, N, 12, 2), filled fold by fold
-    oof = {v: np.zeros((len(args.seeds), len(checkpoints), *train["fut_xy"].shape), np.float32) for v in variants}
-    for si, seed in enumerate(args.seeds):
-        for fold in range(args.folds):
-            held = folds == fold
-            state = (pretrain(windows_without(windows, train["scene_name"][held]), cfg, seed, args.pretrain_epochs,
-                              args.pretrain_cache) if args.pretrain_epochs else None)
-            preds = fit_pair(subset(train, ~held), text[~held], subset(train, held), text[held],
-                             cfg, seed, checkpoints, shuffle_seed=seed * 100 + fold, fusion=args.fusion,
-                             history_state=state, text_dropout=args.text_dropout,
-                             extra_train=None if extra is None else extra[~held],
-                             extra_test=None if extra is None else extra[held],
-                             alt_text_test=None if alt is None else alt[held], blank_test=args.blank_test,
-                             alt_text_train=None if aug is None else aug[~held], alt_prob=args.augment_prob,
-                             head_from=args.head_from_epoch, head_lr=args.head_lr, mirror=mirror)
-            for v in variants:
-                oof[v][si][:, held] = preds[v]
+    per_seed = seed_map(functools.partial(
+        cv_seed, args=args, train=train, text=text, extra=extra, alt=alt, aug=aug, folds=folds, windows=windows,
+        cfg=cfg, checkpoints=checkpoints, variants=variants, mirror=mirror), args.seeds, args.workers)
+    oof = {v: np.stack([s[v] for s in per_seed]) for v in variants}
     elapsed = time.monotonic() - start
 
     gt = train["fut_xy"]
@@ -367,8 +445,8 @@ def run_cv(args) -> None:
     for v in ("h1", "l1"):  # (S, C, N) errors; equal-scene OOF ADE over seeds, earliest epoch on ties
         epochs[v], curve[v] = select_epoch(ade(oof[v], gt[None, None]), checkpoints, train["scene_name"])
     best = {v: checkpoints.index(e) for v, e in epochs.items()}
-    # H1 uses its own CV epoch; L1 and its shuffle test share L1's epoch
-    picked = {"h1": oof["h1"][:, best["h1"]]} | {v: oof[v][:, best["l1"]] for v in variants[1:]}
+    # H1 (and its mirror TTA) uses its own CV epoch; the language model variants share L1's epoch
+    picked = {v: oof[v][:, best["h1" if v.startswith("h1") else "l1"]] for v in variants}
     ades = {v: ade(p, gt[None]).mean(axis=0) for v, p in picked.items()}
 
     name = (("l1" if args.fusion == "concat" else "l2") + ("-p2" if args.pretrain_epochs else "")
@@ -382,7 +460,7 @@ def run_cv(args) -> None:
               "seeds": args.seeds, "epochs_max": args.epochs, "eval_every": args.eval_every,
               "pretrain_epochs": args.pretrain_epochs, "pretrain_rule": PRETRAIN_RULE if args.pretrain_epochs else None,
               "head_from_epoch": args.head_from_epoch,
-              "head_lr": args.head_lr, "mirror": args.mirror,
+              "head_lr": args.head_lr, "mirror": args.mirror, "tta": args.tta,
               "text_dropout": args.text_dropout, **cfg}
     caches = [args.cache_dir / "train.npz"] + ([args.windows] if args.pretrain_epochs else [])
     record = {
@@ -400,6 +478,7 @@ def run_cv(args) -> None:
         "ca_ade": float(ade(prepare(train)[1].numpy(), gt).mean()),
         "metrics": report(ades, train, picked, args.seeds[0]),
         "vs_baseline": vs_baseline(args.baseline_run, args.output_dir, "oof", train, ades, args.seeds, args.seeds[0]),
+        "ensemble": ensemble_report(oof, picked, train, checkpoints, args.seeds),
     }
     if alt is not None:  # ADE of L with the paraphrased instruction minus with the original (positive: worse)
         record["paraphrase"] = {"encoder": args.paraphrase_encoder, "ade": float(ades["l1_paraphrase"].mean()),
@@ -430,6 +509,18 @@ def load_cv(args) -> tuple:
             load_cache(args.windows) if pretrain_epochs else None)
 
 
+def val_seed(seed: int, *, train, text_train, val, text_val, cfg, epochs, pretrain_epochs, windows, fusion, text_dropout,
+             extra_train, extra_val, aug_train, aug_prob, head, mirror, tta) -> dict:
+    """Val predictions {variant: (N, 12, 2)} of one seed at the CV epochs; with `tta` the mirror TTA means."""
+    checkpoints = sorted(set(epochs.values()))
+    state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
+    out = fit_pair(train, text_train, val, text_val, cfg, seed, checkpoints, shuffle_seed=seed,
+                   fusion=fusion, history_state=state, text_dropout=text_dropout,
+                   extra_train=extra_train, extra_test=extra_val, alt_text_train=aug_train, alt_prob=aug_prob,
+                   head_from=head["head_from_epoch"], head_lr=head["head_lr"], mirror=mirror, tta=tta)
+    return {v: out[v + ("_tta" if tta else "")][checkpoints.index(epochs["h1" if v == "h1" else "l1"])] for v in VARIANTS}
+
+
 def run_val(args) -> None:
     cv, cfg, encoder, seeds, epochs, fusion, pretrain_epochs, text_dropout, windows = load_cv(args)
     extra_name = cv["config"].get("extra_encoder")
@@ -445,20 +536,17 @@ def run_val(args) -> None:
     head = {k: cv["config"].get(k) for k in ("head_from_epoch", "head_lr", "mirror")}
     mirror = mirror_specs(encoder, extra_name) if head["mirror"] else None
 
+    if args.tta and mirror is None:
+        raise ValueError("--tta needs a mirror CV config")
+
     start = time.monotonic()
-    preds = {v: [] for v in VARIANTS}
-    for seed in seeds:
-        checkpoints = sorted(set(epochs.values()))
-        state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
-        out = fit_pair(train, text_train, val, text_val, cfg, seed, checkpoints, shuffle_seed=seed,
-                       fusion=fusion, history_state=state, text_dropout=text_dropout,
-                       extra_train=extra_train, extra_test=extra_val, alt_text_train=aug_train, alt_prob=aug_prob,
-                       head_from=head["head_from_epoch"], head_lr=head["head_lr"], mirror=mirror)
-        for v in VARIANTS:
-            epoch = epochs["h1" if v == "h1" else "l1"]
-            preds[v].append(out[v][checkpoints.index(epoch)])
+    per_seed = seed_map(functools.partial(
+        val_seed, train=train, text_train=text_train, val=val, text_val=text_val, cfg=cfg, epochs=epochs,
+        pretrain_epochs=pretrain_epochs, windows=windows, fusion=fusion, text_dropout=text_dropout,
+        extra_train=extra_train, extra_val=extra_val, aug_train=aug_train, aug_prob=aug_prob, head=head,
+        mirror=mirror, tta=args.tta), seeds, args.workers)
     elapsed = time.monotonic() - start
-    preds = {v: np.stack(p) for v, p in preds.items()}
+    preds = {v: np.stack([s[v] for s in per_seed]) for v in VARIANTS}
     ades = {v: ade(p, val["fut_xy"][None]).mean(axis=0) for v, p in preds.items()}
 
     name = ("l1" if fusion == "concat" else "l2") + ("-p2" if pretrain_epochs else "")
@@ -467,7 +555,8 @@ def run_val(args) -> None:
               "extra_encoder": extra_name,
               "baseline": cv["config"]["baseline"], "encoder": encoder,
               "encoder_hf_id": ENCODERS[encoder], "split": "val", "seeds": seeds, "epochs": epochs,
-              "pretrain_epochs": pretrain_epochs, "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob, **head, **cfg}
+              "pretrain_epochs": pretrain_epochs, "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob, **head,
+              "tta": args.tta, **cfg}
     caches = [args.cache_dir / f"{s}.npz" for s in ("train", "val")] + ([args.windows] if pretrain_epochs else [])
     record = {
         "run_id": run_id, **provenance(args, caches,
@@ -491,6 +580,26 @@ def run_val(args) -> None:
             writer.writerow([scene, token, *path.reshape(-1).tolist()])
     print(json.dumps({k: record["metrics"][k] for k in ("ade", "delta_ade", "shuffle_cost")},
                      indent=2))
+
+
+def test_seed(seed: int, *, x, base, y, tx, tbase, text_train, text_test, cfg, epochs, pretrain_epochs, windows, fusion,
+              extra_dim, text_dropout, aug_train, aug_prob, head, mirror, tta) -> dict:
+    """Test predictions {"h1", "l1": (N, 12, 2)} of one seed trained on all of train; with `tta` the mirror TTA means."""
+    mirror_h1, mirror_lm = mirror
+    join = lambda a, b: torch.cat((a, torch.as_tensor(np.asarray(b, dtype=np.float32))), 1)
+    state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
+    h1, lm = make_pair(text_train.shape[1], cfg, seed, fusion, extra_dim, state)
+    if head["head_from_epoch"] is not None:
+        freeze_on_baseline(lm, x, base, y, cfg, seed, extra_dim, state, head["head_from_epoch"], mirror_h1)
+    h1_evals, lm_evals = {"t": (tx, tbase)}, {"t": (join(tx, text_test), tbase)}
+    out_h1 = train_eval(h1, x, base, y, tta_evals(h1_evals, mirror_h1) if tta else h1_evals, cfg, seed, [epochs["h1"]],
+                        mirror=mirror_h1)
+    out_lm = train_eval(lm, join(x, text_train), base, y, tta_evals(lm_evals, mirror_lm) if tta else lm_evals,
+                        cfg | {"lr": head["head_lr"] or cfg["lr"]}, seed, [epochs["l1"]],
+                        text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim,
+                        text_alt=aug_train, alt_prob=aug_prob, mirror=mirror_lm)
+    key = "t_tta" if tta else "t"
+    return {"h1": tta_merge(out_h1)[key][0], "l1": tta_merge(out_lm)[key][0]}
 
 
 def run_test(args) -> None:
@@ -527,19 +636,16 @@ def run_test(args) -> None:
         x, tx = with_text(x, extra_train), with_text(tx, extra_test)
     join = lambda a, b: torch.cat((a, torch.as_tensor(np.asarray(b, dtype=np.float32))), 1)
 
+    if args.tta and mirror_h1 is None:
+        raise ValueError("--tta needs a mirror CV config")
+
     start = time.monotonic()
-    preds = {"h1": [], "l1": []}
-    for seed in seeds:
-        state = pretrain(windows, cfg, seed, pretrain_epochs) if pretrain_epochs else None
-        h1, lm = make_pair(text_train.shape[1], cfg, seed, fusion, extra_dim, state)
-        if head["head_from_epoch"] is not None:
-            freeze_on_baseline(lm, x, base, y, cfg, seed, extra_dim, state, head["head_from_epoch"], mirror_h1)
-        preds["h1"].append(train_eval(h1, x, base, y, {"t": (tx, tbase)}, cfg, seed, [epochs["h1"]],
-                                      mirror=mirror_h1)["t"][0])
-        preds["l1"].append(train_eval(lm, join(x, text_train), base, y, {"t": (join(tx, text_test), tbase)},
-                                      cfg | {"lr": head["head_lr"] or cfg["lr"]}, seed, [epochs["l1"]],
-                                      text_dropout=text_dropout, text_start=HISTORY_DIM + extra_dim,
-                                      text_alt=aug_train, alt_prob=aug_prob, mirror=mirror_lm)["t"][0])
+    per_seed = seed_map(functools.partial(
+        test_seed, x=x, base=base, y=y, tx=tx, tbase=tbase, text_train=text_train, text_test=text_test, cfg=cfg,
+        epochs=epochs, pretrain_epochs=pretrain_epochs, windows=windows, fusion=fusion, extra_dim=extra_dim,
+        text_dropout=text_dropout, aug_train=aug_train, aug_prob=aug_prob, head=head,
+        mirror=(mirror_h1, mirror_lm), tta=args.tta), seeds, args.workers)
+    preds = {v: [s[v] for s in per_seed] for v in ("h1", "l1")}
     elapsed = time.monotonic() - start
 
     run_id = args.run_id or f"{datetime.now():%Y%m%d-%H%M}-submission-v{args.version}"
@@ -563,8 +669,8 @@ def run_test(args) -> None:
     config = {"stage": "test", "purpose": "submission", "from_cv": args.from_cv, "model": cv["config"]["model"],
               "extra_encoder": extra_name,
               "fusion": fusion, "encoder": encoder, "seeds": seeds, "epochs": epochs, "pretrain_epochs": pretrain_epochs,
-              "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob, **head,
-              "policy": "first instruction per scene, mean trajectory over seeds",
+              "text_dropout": text_dropout, "augment_encoder": aug_name, "augment_prob": aug_prob, **head, "tta": args.tta,
+              "policy": "first instruction per scene, mean trajectory over seeds" + (" and the input mirror" if args.tta else ""),
               "team": args.team, "version": args.version, **cfg}
     caches = [args.cache_dir / f"{s}.npz" for s in ("train", "test")] + ([args.windows] if pretrain_epochs else [])
     record = {"run_id": run_id, **provenance(args, caches, [args.feature_dir / f"{encoder}_{s}.npy" for s in ("train", "test")]),
@@ -583,6 +689,7 @@ def main() -> None:
     parser.add_argument("--pretrain-cache", type=Path, default=None,
                         help="reuse P2 pretrained states across runs (same windows, config, seed, epochs); e.g. data/pretrain_cache")
     parser.add_argument("--baseline-run", default=None, help="run of the same stage whose H1 this one is compared to")
+    parser.add_argument("--workers", type=int, default=1, help="seeds trained in parallel processes (same results)")
     sub = parser.add_subparsers(dest="stage", required=True)
     cv = sub.add_parser("cv", help="5-fold CV by scene on train")
     cv.add_argument("--encoder", choices=list(ENCODERS), default="minilm")
@@ -603,6 +710,8 @@ def main() -> None:
     cv.add_argument("--head-lr", type=float, default=None, help="learning rate of the language model (default: --lr)")
     cv.add_argument("--mirror", action="store_true",
                     help="flip half of the fine tuning rows left to right, in both models (drivex26.mirror)")
+    cv.add_argument("--tta", action="store_true",
+                    help="also evaluate every model as the mean of its input and its mirror (h1_tta, l1_tta); needs --mirror")
     cv.add_argument("--paraphrase-encoder", default=None,
                     help="text features of the same instructions said differently; adds a robustness evaluation")
     cv.add_argument("--augment-encoder", default=None,
@@ -614,15 +723,16 @@ def main() -> None:
                     help="non language input given to both models (e.g. map); needs --fusion film")
     val = sub.add_parser("val", help="one-time val evaluation at the epochs a CV run picked")
     val.add_argument("--from-cv", required=True)
+    val.add_argument("--tta", action="store_true", help="predict as the mean of input and mirror (mirror CV config)")
     test = sub.add_parser("test", help="submission files from the pair a CV run picked (test read for submission only)")
     test.add_argument("--from-cv", required=True)
+    test.add_argument("--tta", action="store_true", help="predict as the mean of input and mirror (mirror CV config)")
     test.add_argument("--team", required=True, help="team name exactly as in the upload form")
     test.add_argument("--version", type=int, required=True, help="0 for the first upload, +1 per resubmission")
     test.add_argument("--out-dir", default=None, help="defaults to data/submissions/<run_id>/")
     args = parser.parse_args()
 
-    torch.use_deterministic_algorithms(True)
-    torch.set_num_threads(1)
+    init_worker()
     if args.stage == "cv":
         if args.epochs < args.eval_every or args.eval_every < 1 or args.batch_size < 1:
             parser.error("need epochs >= eval-every >= 1 and a positive batch size")

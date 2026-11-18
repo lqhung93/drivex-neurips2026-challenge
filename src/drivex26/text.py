@@ -18,6 +18,7 @@ ENCODERS = {
     "clip": "openai/clip-vit-base-patch32",
     "map": "nuscenes-map-expansion-v1.3 lane features (drivex26.map_features v1, not a text encoder)",
     "map2": "nuscenes-map-expansion-v1.3 candidate centerlines (drivex26.map_features v2, not a text encoder)",
+    "mapcam": "map v1 + CLIP ViT-B/32 of the CAM_FRONT anchor image, original and mirrored, PCA (drivex26.vision, not a text encoder)",
     "intent": "Qwen/Qwen2.5-3B-Instruct structured intents, one-hot (scripts/language/encode_intent.py)",
     "intentvote": "field-wise majority of the intents of the instruction and 4 Qwen rewrites (scripts/language/encode_vote.py)",
     "intenttime": "intent one-hot + timing flags of the first action (scripts/language/encode_timing.py)",
